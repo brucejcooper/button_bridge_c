@@ -1,0 +1,55 @@
+;
+; For handling manchester encoded DALI signals (1200 baud, one start bit of 1), both read and write.
+;
+
+
+.program dali_tx
+wait_for_cmd:
+    ; Transmission
+    set y, 16
+
+send_bit:
+    out x, 1                    ; Will autopull 17 bits as needed
+    mov pins, x         [7]     ; Send the first half of the bit
+    mov pins, !x        [5]     ; Send the inverted second half
+    jmp y--, send_bit
+    set pins, 0         [30]    ; return to 0 for 2 bit periods (Stop bits)
+    
+
+
+    out x, 15                   ; read reply timeout in double ticks from osr - will always be 88 (22te x4 (because each loop takes 2 ticks))
+wait_start_bit:
+    jmp pin, read_one           ; Wait for the start of the start bit (a 1)
+    jmp x--, wait_start_bit     ; No transition yet, check to see if we've timed out.
+
+    mov isr,x                   ; No response within 22Te - send x =0xFFFFFFFF - This also happens to be exactly the right amount of delay between commands.
+    push 
+    irq 0
+    jmp wait_for_cmd
+
+                                ; Just after start of 1 bit
+read_one:
+    set x,1
+    wait 0 pin 0                  ; Wait for half point, then jump to start of next bit
+    
+read_bit:
+    in x, 1             [8]     ; Push the previous bit we just read. then wait till we're into the first half of the next bit
+    jmp pin, read_one
+    
+                                ; two ticks after start of 0 bit
+read_zero:
+    set x,0             [3] 
+    jmp pin, read_bit           ; Wait for bit transition 0->1 (indicating that we've really read a zero-one (0) transition)
+    jmp pin, read_bit           ; repeat a number of times - we do it this way so that it will react to the change immediately, but we still have a timeout
+    jmp pin, read_bit           ; Wait for bit transition 0->1 (indicating that we've really read a zero-one (0) transition)
+    jmp pin, read_bit           ; repeat a number of times - we do it this way so that it will react to the change immediately, but we still have a timeout
+    
+    push                        ; Never received anything.  Must have ended transmission.  Send what we've got.
+
+
+
+    set x, 20                   ; delay 22te after response received
+post_cmd_idle_loop:
+    nop                 [7]  
+    jmp x--, post_cmd_idle_loop     
+

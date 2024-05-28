@@ -1,0 +1,19 @@
+#ifndef _DALI_H
+#define _DALI_H
+
+#include <stdint.h>
+#include <stdbool.h>
+#include "async.h"
+
+#define DALI_NAK -1
+#define DALI_TIMEOUT -2
+#define DALI_BUS_ERROR -3
+
+void dali_init(uint32_t tx_pin, uint32_t rx_pin);
+void dali_toggle(int addr);
+void dali_set_on(int addr, bool is_on);
+void dali_set_level(int addr, int level);
+void dali_fade(int addr, int velocity);
+void dali_enumerate_task(async_ctx_t *ctx);
+
+#endif
