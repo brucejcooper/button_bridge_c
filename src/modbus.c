@@ -7,13 +7,11 @@
 #include "stdint.h"
 #include <string.h>
 #include <stdio.h>
-#include "async.h"
+#include "queue.h"
 
 static uint32_t coil_values;
 static uint8_t buf[9];
 static uint8_t *bufptr;
-static volatile int modbus_lock = 0;
-absolute_time_t read_timeout;
 
 static uint8_t xor = 0;
 static uint16_t crc = 0xFFFF;
@@ -21,6 +19,34 @@ static uint16_t crc = 0xFFFF;
 static int cs_pin;
 
 #define UART uart1
+
+typedef enum
+{
+    OP_CLEAR,
+    OP_SET,
+    OP_TOGGLE,
+    OP_FETCH,
+    OP_NONE = 0xFF,
+} op_t;
+
+typedef struct
+{
+    int address;
+    int coil;
+    op_t op;
+} cmd_t;
+
+#define QUEUE_DEPTH 10
+static cmd_t queue_data[QUEUE_DEPTH];
+static queue_t cmd_queue;
+static cmd_t in_flight = {
+    .address = 0,
+    .coil = 0,
+    .op = OP_NONE,
+};
+absolute_time_t timeout;
+
+const char *modbus_entity_prefix = "modbus";
 
 static inline void reset_buf()
 {
@@ -31,6 +57,9 @@ static inline void reset_buf()
 
 void modbus_init(int tx_pin, int rx_pin, int cs)
 {
+
+    queue_init(&cmd_queue, queue_data, sizeof(cmd_t), QUEUE_DEPTH);
+
     uart_init(UART, 9600);
     coil_values = 0;
 
@@ -107,22 +136,7 @@ static inline bool crc_is_valid()
 
 static void print_status(int index, bool is_on)
 {
-    printf("\r\tmodbus%d %s\n", index, is_on ? "on" : "off");
-}
-
-static int acquire_lock()
-{
-    if (modbus_lock == 0)
-    {
-        modbus_lock = 1;
-        return true;
-    }
-    return false;
-}
-
-static inline void release_lock()
-{
-    modbus_lock = 0;
+    printf("\r\t%s%d %s\n", modbus_entity_prefix, index, is_on ? "on" : "off");
 }
 
 /**
@@ -147,24 +161,24 @@ static bool bytes_available(size_t expected_sz)
 
 #define BYTE_TRANSMISSION_DELAY_US(n_bits) (n_bits * 10 * 1000000 / 9600)
 
-void set_coil_task(async_ctx_t *ctx)
+static inline void wait_for_transmission(int nbytes)
 {
-    async_begin();
-    await(acquire_lock());
-    await(uart_is_writable(UART));
+    // Wait for enough time for the transmission to occur
+    // TODO use hardware timer
+    sleep_until(make_timeout_time_us(BYTE_TRANSMISSION_DELAY_US(8)));
+    // Set DE back low, so that we can receive the response
+    gpio_put(cs_pin, 0);
+}
 
-    // Clear out the UART Receive fifo.
-    while (uart_is_readable(UART))
-    {
-        uart_getc(UART);
-    }
-
+static void send_set_coil(uint8_t devaddr, int coil_num, op_t val)
+{
     reset_buf();
-    append(ctx->bdata[0]);
+    append(devaddr);
     append(0x05);
     append(00);
-    append(ctx->bdata[1]);
-    append(ctx->bdata[2]);
+    append(coil_num);
+    append(val == OP_TOGGLE ? 0x55 : val == OP_SET ? 0xFF
+                                                   : 0x00);
     append(0x00);
     append_crc();
 
@@ -174,127 +188,116 @@ void set_coil_task(async_ctx_t *ctx)
     // This could techically block, but we only write one thing at a time, and we've got a lock
     // around it, so its _very_ unlikely as long as we write less than the Queue depth
     uart_write_blocking(UART, buf, 8);
-    reset_buf();
 
-    // It takes some time for the transmission to occur.  DE must be high for that period.  This makes the assumption that
-    // Transmission will occur immediately
-    read_timeout = make_timeout_time_us(BYTE_TRANSMISSION_DELAY_US(8));
-    // Wait for the transmission to complete.
-    await(time_reached(read_timeout));
-    // Set DE back low, so that we can receive the response
-    gpio_put(cs_pin, 0);
-
-    reset_buf();
-    read_timeout = make_timeout_time_ms(100);
-    await(bytes_available(8) || time_reached(read_timeout));
-
-    if (time_reached(read_timeout))
+    wait_for_transmission(8);
+    switch (val)
     {
-        printf("Timeout receiving response from Modbus\n");
-        goto cleanup;
-    }
-
-    if (buf[0] != ctx->bdata[0] || buf[1] != 0x05)
-    {
-        printf("MODBUS didn't reflect command\n");
-        goto cleanup;
-    }
-    if (!crc_is_valid())
-    {
-        printf("CRC mismatch\n");
-        goto cleanup;
-    }
-
-    int coil_num = ctx->bdata[1];
-    switch (ctx->bdata[2])
-    {
-    case 0:
+    case OP_CLEAR:
         coil_values &= ~(1 << coil_num);
         break;
-    case 0xFF:
+    case OP_SET:
         coil_values |= 1 << coil_num;
         break;
-    case 0x55:
+    case OP_TOGGLE:
         // TODO go stateless - its more reliable, plus it'll save us 4 bytes :P
         coil_values ^= 1 << coil_num;
         break;
     }
     print_status(coil_num, coil_values & (1 << coil_num));
-cleanup:
-    release_lock();
-    async_end();
 }
 
-void modbus_set_coil(uint8_t devaddr, int coil_num, int val)
+static void request_coil_status(int devaddr)
 {
-    uint8_t bytes[3] = {devaddr, coil_num, val == 2 ? 0x55 : val == 1 ? 0xFF
-                                                                      : 0x00};
-
-    async_start_taskb(set_coil_task, bytes, 3);
-}
-
-static void printbuf(uint8_t *ptr, size_t sz)
-{
-    while (sz--)
-    {
-        printf("%02x", *ptr++);
-    }
-    printf("\n");
-}
-
-void modbus_enumerate_task(async_ctx_t *ctx)
-{
-    async_begin();
-    printf("Enumerating Modbus devices\n");
-    await(acquire_lock());
-    await(uart_is_writable(UART));
+    printf("Enumerating Modbus devices at address %d\n", devaddr);
 
     reset_buf();
-    append(ctx->idata);
+    append(devaddr);
     append(0x01);
     append(0x00);
     append(0x00);
     append(0x00);
     append(0x20);
     append_crc();
-
     gpio_put(cs_pin, 1);
-
     // Technically this can block, but it probably won't (the FIFO is 32 bytes long)
     uart_write_blocking(UART, buf, 8);
-    read_timeout = make_timeout_time_us(BYTE_TRANSMISSION_DELAY_US(8));
-    reset_buf();
+    wait_for_transmission(8);
+}
 
-    // Wait for the transmission to complete.
-    await(time_reached(read_timeout));
-    gpio_put(cs_pin, 0);
+void modbus_enumerate()
+{
+    cmd_t cmd = {
+        .address = 1,
+        .coil = 0,
+        .op = OP_FETCH};
+    queue_add(&cmd_queue, &cmd);
+}
 
-    read_timeout = make_timeout_time_ms(100);
-    await(bytes_available(9) || time_reached(read_timeout));
-    if (time_reached(read_timeout))
+void modbus_set_coil(uint8_t devaddr, int coil_num, int val)
+{
+    cmd_t cmd = {
+        .address = devaddr,
+        .coil = coil_num,
+        .op = val,
+    };
+    queue_add(&cmd_queue, &cmd);
+}
+
+void modbus_poll()
+{
+
+    if (in_flight.op != OP_NONE)
     {
-        printf("Timeout receiving response from Modbus\n");
-        goto cleanup;
-    }
-    printbuf(buf, 9);
+        if (bytes_available(in_flight.op == OP_FETCH ? 9 : 8))
+        {
+            if (crc_is_valid())
+            {
+                switch (in_flight.op)
+                {
+                case OP_FETCH:
 
-    if (!crc_is_valid())
+                    coil_values = (buf[3] << 24) | (buf[4] << 16) | (buf[5] << 8) | buf[6];
+                    printf("coils 0x%08x\n", coil_values);
+
+                    for (int coil = 0; coil < 32; coil++)
+                    {
+                        printf("\r\tdevice %s%d name=\"Modbus relay %d\"\n", modbus_entity_prefix, coil, coil);
+                        printf("\r\tswitch %s%d device=%s%d\n", modbus_entity_prefix, coil, modbus_entity_prefix, coil);
+                        print_status(coil, coil_values & (1 << coil));
+                    }
+                    break;
+                default:
+                    printf("Ignoring response from modbus set_coil op\n");
+                }
+            }
+            else
+            {
+                printf("CRC mismatch on response\n");
+            }
+        }
+        else if (time_reached(timeout))
+        {
+            printf("Timeout receiving response from Modbus. Assuming no response will be forthcoming\n");
+        }
+        in_flight.op = OP_NONE;
+    }
+
+    if (uart_is_writable(UART) && queue_get(&cmd_queue, &in_flight))
     {
-        printf("CRC mismatch\n");
-        goto cleanup;
+        timeout = make_timeout_time_ms(1000); // Give the TX 1000 ms.
+        switch (in_flight.op)
+        {
+        case OP_SET:
+        case OP_CLEAR:
+        case OP_TOGGLE:
+            send_set_coil(in_flight.address, in_flight.coil, in_flight.op);
+            break;
+        case OP_FETCH:
+            break;
+        }
+        // We expect to see a response in a handful of ms, but give it a bit longer, just in case.
+        timeout = make_timeout_time_ms(100);
+        // Reset read buffer for read.
+        reset_buf();
     }
-
-    coil_values = (buf[3] << 24) | (buf[4] << 16) | (buf[5] << 8) | buf[6];
-    printf("coils 0x%08x\n", coil_values);
-
-    for (ctx->idata = 0; ctx->idata < 32; ctx->idata++)
-    {
-        printf("\r\tdevice modbus%d name=\"Modbus relay %d\"\n", ctx->idata, ctx->idata);
-        printf("\r\tswitch modbus%d device=modbus%d\n", ctx->idata, ctx->idata);
-        print_status(ctx->idata, coil_values & (1 << ctx->idata));
-        async_yield();
-    }
-cleanup:
-    release_lock();
-    async_end();
 }

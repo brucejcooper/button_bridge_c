@@ -1,11 +1,12 @@
 #include <hardware/clocks.h>
+#include <pico/stdlib.h>
 #include "dali.h"
 #include "stdbool.h"
 #include "stdint.h"
 #include "dali.pio.h"
 #include <string.h>
 #include <stdio.h>
-#include "async.h"
+#include "queue.h"
 
 #define DALI_ADDR_FROM_CMD(cmd) ((cmd >> 9) & 0x3F)
 
@@ -35,207 +36,135 @@
 #define DALI_STATUS_MISSING_SHORT_ADDR 0x40
 #define DALI_STATUS_MISSING_POWER_FAILURE 0x80
 
+#define DALI_MAX_ADDR 63
+
 static const PIO pio = pio0;
 static const unsigned int dali_sm = 0;
 
-static volatile int bus_lock = 0;
+struct dali_cmd_t;
+typedef void (*cmd_complete_cb_t)(int res, struct dali_cmd_t *cb);
 
-static inline int dali_send_cmd(uint16_t cmd)
+typedef struct dali_cmd_t
 {
-    if (pio_sm_is_tx_fifo_full(pio, dali_sm))
+    uint16_t op;
+    cmd_complete_cb_t then;
+} dali_cmd_t;
+
+#define QUEUE_DEPTH 10
+static dali_cmd_t queue_data[QUEUE_DEPTH];
+static queue_t cmd_queue;
+static dali_cmd_t in_flight = {
+    .op = 0,
+    .then = NULL,
+};
+// During an enumerate, we need to collate several values at once - We do that here.
+// Due to the fact that all values are done during one "in_flight" tx, we don't need to worry about re-entrant behavior.
+static int enumerate_min;
+
+const char *dali_entity_prefix = "dali";
+
+// ------------------------- in-flight action callbacks ----------------
+
+static void report_level_with_fade(int _unused, dali_cmd_t *cmd);
+static void enumerate_got_min(int min, dali_cmd_t *cmd);
+
+static void enumerate_addr(int addr)
+{
+    // This is a new enqueue, rather than a continuation, because we want it possible for other commands to execute interleaved.
+    dali_cmd_t cmd = {
+        .op = DALI_CMD_QUERY_MIN(addr),
+        .then = enumerate_got_min,
+    };
+    queue_add(&cmd_queue, &cmd);
+}
+
+static void enumerate_got_max(int max, dali_cmd_t *cmd)
+{
+    int addr = DALI_ADDR_FROM_CMD(cmd->op);
+    printf("\r\tdevice %s%d name=\"DALI light fixture %d\"\n", dali_entity_prefix, addr, addr);
+    printf("\r\tlight %s%d device=%s%d", dali_entity_prefix, addr, dali_entity_prefix, addr);
+    // If device is dimmable, add additional parameters to discovery line
+    if (enumerate_min != max)
     {
-        return 0;
+        printf(" brightness=true supported_color_modes=brightness brightness_scale=254 min=%d max=%d", enumerate_min, max);
     }
-    uint32_t v = ((cmd << 15) | 0x80000000) + 88;
-
-    pio_sm_put(pio, dali_sm, v);
-    return 1;
-}
-
-static inline int dali_get_response(int *out)
-{
-    if (pio_sm_is_rx_fifo_empty(pio, dali_sm))
+    printf("\n");
+    // Seperately enqueue a command to report the level, testing to see if it has faded.
+    // We do this because, although unlikely, the device might have been mid-fade during the enumerate.
+    report_level_with_fade(0, cmd);
+    if (addr < DALI_MAX_ADDR)
     {
-        return 0;
-    }
-    int v = pio_sm_get(pio, dali_sm);
-    if (out)
-    {
-        *out = v == 0xFFFFFFFF ? -1 : v & 0xFF;
-    }
-    return 1;
-}
-
-static inline void report_status(int addr, int level)
-{
-    printf("\r\tdali%d state=%s brightness=%d\n", addr, level > 0 ? "on" : "off", level);
-}
-
-static inline bool acquire_lock()
-{
-    if (bus_lock == 0)
-    {
-        bus_lock = 1;
-        return true;
-    }
-    return false;
-}
-
-static inline bool release_lock()
-{
-    bus_lock = 0;
-}
-
-static void process_dali_cmd_and_report_task(async_ctx_t *ctx)
-{
-    int level;
-
-    async_begin();
-    await(acquire_lock());
-    await(dali_send_cmd(ctx->idata));
-    await(dali_get_response(NULL));
-
-    // Level was insta-applied (we hope), so we can simply report once.
-    await(dali_send_cmd(DALI_CMD_QUERY_ACTUAL_LEVEL(DALI_ADDR_FROM_CMD(ctx->idata))));
-    await(dali_get_response(&level));
-    report_status(DALI_ADDR_FROM_CMD(ctx->idata), level);
-
-    release_lock();
-    async_end();
-}
-
-static void process_dali_cmd_and_report_fade_task(async_ctx_t *ctx)
-{
-    // Used to store results. Remember that it will be reset each time the function yeilds
-    async_begin();
-    await(acquire_lock());
-
-    await(dali_send_cmd(ctx->idata));
-    await(dali_get_response(NULL));
-    release_lock();
-    async_yield();
-
-    // We extract the original address from the command, and use that in the subsequent status checks.
-    ctx->idata = DALI_ADDR_FROM_CMD(ctx->idata);
-    do
-    {
-        await(acquire_lock());
-        await(dali_send_cmd(DALI_CMD_QUERY_ACTUAL_LEVEL(ctx->idata)));
-        await(dali_get_response(&ctx->scratch));
-        report_status(ctx->idata, ctx->scratch);
-
-        await(dali_send_cmd(DALI_CMD_QUERY_STATUS(ctx->idata)));
-        await(dali_get_response(&ctx->scratch));
-        release_lock();
-        async_yield();
-    } while (ctx->scratch > 0 && ctx->scratch & DALI_STATUS_FADE_IN_PROGRESS);
-    async_end();
-}
-
-void dali_enumerate_task(async_ctx_t *ctx)
-{
-    // Cheat's way of getting long lived results - Don't start two enumerations in parallel
-    static int level, min, max;
-
-    async_begin();
-
-    for (ctx->idata = 0; ctx->idata < 64; ctx->idata++)
-    {
-        await(acquire_lock());
-        await(dali_send_cmd(DALI_CMD_QUERY_ACTUAL_LEVEL(ctx->idata)));
-        await(dali_get_response(&level));
-        if (level >= 0)
-        {
-            await(dali_send_cmd(DALI_CMD_QUERY_MIN(ctx->idata)));
-            await(dali_get_response(&min));
-            await(dali_send_cmd(DALI_CMD_QUERY_MAX(ctx->idata)));
-            await(dali_get_response(&max));
-            printf("\r\tdevice dali%d name=\"DALI light fixture %d\"\n", ctx->idata, ctx->idata);
-
-            printf("\r\tlight dali%d device=dali%d", ctx->idata, ctx->idata);
-            // If device is dimmable, add additional parameters to discovery line
-            if (min != max)
-            {
-                printf(" brightness=true supported_color_modes=brightness brightness_scale=254 min=%d max=%d", min, max);
-            }
-            printf("\n");
-            report_status(ctx->idata, level);
-        }
-        release_lock();
-        async_yield(); // Give other async tasks that want access to the bus a go. Without this, we would simply re-lock immediately.
-    }
-    async_end();
-}
-
-void dali_set_level(int addr, int level)
-{
-    async_start_task(process_dali_cmd_and_report_fade_task, addr << 9 | level);
-}
-
-static void toggle_task(async_ctx_t *ctx)
-{
-    int val;
-
-    async_begin();
-    await(acquire_lock());
-
-    await(dali_send_cmd(DALI_CMD_QUERY_ACTUAL_LEVEL(ctx->idata)));
-    await(dali_get_response(&val));
-
-    if (val)
-    {
-        await(dali_send_cmd(DALI_CMD_OFF(ctx->idata)));
-        await(dali_get_response(&val));
-        await(dali_send_cmd(DALI_CMD_QUERY_ACTUAL_LEVEL(ctx->idata)));
-        await(dali_get_response(&val));
-        report_status(ctx->idata, val);
-    }
-    else
-    {
-        await(dali_send_cmd(DALI_CMD_RECALL_LAST_ACTIVE_LEVEL(ctx->idata)));
-        await(dali_get_response(&val));
-
-        val = DALI_STATUS_FADE_IN_PROGRESS;
-        while (val > 0 && val & DALI_STATUS_FADE_IN_PROGRESS)
-        {
-            await(dali_send_cmd(DALI_CMD_QUERY_ACTUAL_LEVEL(ctx->idata)));
-            await(dali_get_response(&val));
-            report_status(DALI_ADDR_FROM_CMD(ctx->idata), val);
-            await(dali_send_cmd(DALI_CMD_QUERY_STATUS(ctx->idata)));
-            await(dali_get_response(&val));
-        }
-    }
-
-    release_lock();
-    async_end();
-}
-
-void dali_set_on(int addr, bool is_on)
-{
-    if (is_on)
-    {
-        async_start_task(process_dali_cmd_and_report_fade_task, DALI_CMD_RECALL_LAST_ACTIVE_LEVEL(addr));
-    }
-    else
-    {
-        async_start_task(process_dali_cmd_and_report_task, DALI_CMD_OFF(addr));
+        // Start a new task to enumerate the next address.
+        enumerate_addr(addr + 1);
     }
 }
 
-void dali_fade(int addr, int velocity)
+static void enumerate_got_min(int min, dali_cmd_t *cmd)
 {
-    async_start_task(process_dali_cmd_and_report_fade_task, velocity > 0 ? DALI_CMD_UP(addr) : DALI_CMD_DOWN(addr));
+
+    int addr = DALI_ADDR_FROM_CMD(cmd->op);
+    if (min >= 0)
+    {
+        enumerate_min = min;
+        cmd->op = DALI_CMD_QUERY_MIN(DALI_ADDR_FROM_CMD(cmd->op));
+        cmd->then = enumerate_got_max;
+    }
+    else if (addr < DALI_MAX_ADDR)
+    {
+        // There was no reply from the device.  It probably doesn't exist.
+        // TODO consider retries...
+        // Start a new task to enumerate the next address.
+        printf("No device responded for address %d\n", addr + 1);
+        enumerate_addr(addr + 1);
+    }
 }
 
-void dali_toggle(int addr)
+static void fade_received_status(int status, dali_cmd_t *cmd)
 {
-    async_start_task(toggle_task, addr);
+    int addr = DALI_ADDR_FROM_CMD(cmd->op);
+    if (status & DALI_STATUS_FADE_IN_PROGRESS)
+    {
+        // Fade still active.  Enqueue another one
+        report_level_with_fade(status, cmd);
+    }
 }
+
+static void fade_received_level(int lvl, dali_cmd_t *cmd)
+{
+    int addr = DALI_ADDR_FROM_CMD(cmd->op);
+    printf("\r\t%s%d state=%s brightness=%d\n", dali_entity_prefix, addr, lvl > 0 ? "on" : "off", lvl);
+
+    cmd->op = DALI_CMD_QUERY_STATUS(addr);
+    cmd->then = fade_received_status;
+}
+
+static void report_level_with_fade(int _unused, dali_cmd_t *cmd)
+{
+    int addr = DALI_ADDR_FROM_CMD(cmd->op);
+    // We don't want other commands to be stalled waiting for a fade to conclude, so we push a new command rather than update the existing one.
+    dali_cmd_t newcmd = {
+        .op = DALI_CMD_QUERY_ACTUAL_LEVEL(addr),
+        .then = fade_received_level,
+    };
+    queue_add(&cmd_queue, &newcmd);
+}
+
+static void toggle_action(int lvl, dali_cmd_t *cmd)
+{
+    // Follow through from level check to send out the on or off command.
+    int addr = DALI_ADDR_FROM_CMD(cmd->op);
+    cmd->op = lvl > 0 ? DALI_CMD_OFF(addr) : DALI_CMD_RECALL_LAST_ACTIVE_LEVEL(addr);
+    cmd->then = report_level_with_fade;
+}
+
+// ----------------------------- API -------------------------
 
 void dali_init(uint32_t tx_pin, uint32_t rx_pin)
 {
     printf("DALI TX pin %d, RX pin %d\n", tx_pin, rx_pin);
-    // Set up DALI program
+    // An enumeration will use 64 entries in the queue, so we give it some space.
+    queue_init(&cmd_queue, queue_data, sizeof(dali_cmd_t), QUEUE_DEPTH);
+
     uint offset = pio_add_program(pio, &dali_tx_program);
 
     // Tell PIO to initially drive output-low on the selected pin, then map PIO
@@ -260,4 +189,78 @@ void dali_init(uint32_t tx_pin, uint32_t rx_pin)
 
     pio_sm_init(pio, dali_sm, offset, &c);
     pio_sm_set_enabled(pio, dali_sm, true);
+}
+
+static inline void send_dali_cmd(uint cmd)
+{
+    // This says blocking, but it is very unlikely that it will ever block, due to the serial nature of how commands are executed.
+    pio_sm_put_blocking(pio, dali_sm, ((cmd << 15) | 0x80000000) + 88);
+}
+
+void dali_poll()
+{
+    if (in_flight.then)
+    {
+        if (!pio_sm_is_rx_fifo_empty(pio, dali_sm))
+        {
+            uint32_t v = pio_sm_get(pio, dali_sm);
+            cmd_complete_cb_t cb = in_flight.then;
+            // If the callback explicitly sets a new *op* and *then*, then we will transmit it, otherwise we will assume that that transaction is done.
+            in_flight.then = NULL;
+            int res = v == 0xFFFFFFFF ? -1 : v & 0xFF;
+            cb(res, &in_flight);
+            if (in_flight.then)
+            {
+                // The callback has set a followup command, so send it out.
+                send_dali_cmd(in_flight.op);
+            }
+        }
+    }
+    else if (queue_get(&cmd_queue, &in_flight))
+    {
+        send_dali_cmd(in_flight.op);
+    }
+}
+
+void dali_toggle(int addr)
+{
+    dali_cmd_t cmd = {
+        .op = DALI_CMD_QUERY_ACTUAL_LEVEL(addr),
+        .then = toggle_action,
+    };
+    queue_add(&cmd_queue, &cmd);
+}
+
+void dali_set_on(int addr, bool is_on)
+{
+    dali_cmd_t cmd = {
+        .op = is_on ? DALI_CMD_RECALL_LAST_ACTIVE_LEVEL(addr) : DALI_CMD_OFF(addr),
+        .then = report_level_with_fade,
+    };
+    queue_add(&cmd_queue, &cmd);
+}
+
+void dali_set_level(int addr, int level)
+{
+    dali_cmd_t cmd = {
+        .op = addr << 9 | level,
+        .then = report_level_with_fade,
+    };
+    queue_add(&cmd_queue, &cmd);
+}
+
+void dali_enumerate()
+{
+    // First, see if the first address returns a level.  Callbacks will iterate the rest.
+    printf("Enumerating all DALI devices\n");
+    enumerate_addr(0);
+}
+
+void dali_fade(int addr, int velocity)
+{
+    dali_cmd_t cmd = {
+        .op = velocity > 0 ? DALI_CMD_UP(addr) : DALI_CMD_DOWN(addr),
+        .then = report_level_with_fade,
+    };
+    queue_add(&cmd_queue, &cmd);
 }

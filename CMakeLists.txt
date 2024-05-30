@@ -1,7 +1,6 @@
 cmake_minimum_required(VERSION 3.5)
 
 include(libraries/pico-sdk/pico_sdk_init.cmake)
-# include(libraries/FreeRTOS-Kernel/portable/ThirdParty/GCC/RP2040/FreeRTOS_Kernel_import.cmake)
 project(button_handler)
 
 
@@ -9,7 +8,9 @@ add_executable(button_handler
    src/main.c
    src/dali.c
    src/modbus.c
-   src/async.c
+   src/queue.c
+   src/buttons.c
+   src/cli.c
 )
 
 

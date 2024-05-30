@@ -4,13 +4,18 @@
             "name": "RP2040",
             "includePath": [
                 "${workspaceFolder}/libraries/pico-sdk/src/**", 
+                "${workspaceFolder}/libraries/FreeRTOS-Kernel/include", 
                 "${workspaceFolder}/build", 
+                "${workspaceFolder}/src", 
                 "${workspaceFolder}/build/generated/pico_base/"
             ],
             "defines": [
                 "_DEBUG",
                 "UNICODE",
-                "_UNICODE"
+                "_UNICODE",
+                "LIB_PICO_STDIO_USB",
+                "CFG_TUD_CDC",
+                "CFG_TUD_ENABLED"
             ],
             "windowsSdkVersion": "10.0.22000.0",
             "intelliSenseMode": "gcc-arm",
