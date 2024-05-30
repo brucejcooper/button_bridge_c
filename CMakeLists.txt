@@ -19,6 +19,7 @@ target_include_directories(button_handler PRIVATE ${CMAKE_CURRENT_LIST_DIR}/src 
 # initialize the Raspberry Pi Pico SDK
 pico_sdk_init()
 pico_generate_pio_header(button_handler ${CMAKE_CURRENT_LIST_DIR}/src/dali.pio)
+pico_generate_pio_header(button_handler ${CMAKE_CURRENT_LIST_DIR}/src/modbus.pio)
 pico_enable_stdio_usb(button_handler 1)
 pico_enable_stdio_uart(button_handler 0)
 

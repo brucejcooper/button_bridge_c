@@ -32,15 +32,6 @@ void enumerate_all()
     buttons_enumerate();
 }
 
-static void loop()
-{
-    buttons_poll();
-    dali_poll();
-    modbus_poll();
-    cli_poll();
-    watchdog_update();
-}
-
 int main()
 {
     // Set ourselves up to run at 48Mhz, off the USB PLL - This should save some current and we don't have much in the
@@ -77,7 +68,11 @@ int main()
 
     for (;;)
     {
-        loop();
+        buttons_poll();
+        dali_poll();
+        modbus_poll();
+        cli_poll();
+        watchdog_update();
     }
 
     return 0;

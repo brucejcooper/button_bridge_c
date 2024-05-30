@@ -1,6 +1,9 @@
 #include "cli.h"
 #include <pico/stdlib.h>
 #include <hardware/regs/addressmap.h>
+#include <hardware/regs/vreg_and_chip_reset.h>
+#include <hardware/structs/vreg_and_chip_reset.h>
+#include <hardware/watchdog.h>
 #include <string.h>
 #include <stdio.h>
 #include <ctype.h>
@@ -166,6 +169,28 @@ static void process_cmd(char *cmd)
         {
             printf("Enumerating entities\n");
             enumerate_all();
+            success = true;
+        }
+        else if (strcmp(tok, "debug") == 0)
+        {
+            printf("Reboot reason:");
+            if (vreg_and_chip_reset_hw->chip_reset & VREG_AND_CHIP_RESET_CHIP_RESET_HAD_POR_BITS)
+            {
+                printf("POR or BOD\n");
+            }
+            else if (vreg_and_chip_reset_hw->chip_reset & VREG_AND_CHIP_RESET_CHIP_RESET_HAD_RUN_BITS)
+            {
+                printf("Run Pin\n");
+            }
+            else if (vreg_and_chip_reset_hw->chip_reset & VREG_AND_CHIP_RESET_CHIP_RESET_HAD_PSM_RESTART_BITS)
+            {
+                printf("Debug Port\n");
+            }
+            else
+            {
+                printf("Unknown\n");
+            }
+
             success = true;
         }
         else if (starts_with(tok, dali_entity_prefix, &after_prefix))

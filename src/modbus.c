@@ -1,6 +1,9 @@
 #include <hardware/clocks.h>
 #include <pico/stdlib.h>
-#include <hardware/uart.h>
+#include <pico/platform.h>
+#include <hardware/timer.h>
+#include <hardware/structs/timer.h>
+#include "modbus.pio.h"
 #include <hardware/irq.h>
 #include "modbus.h"
 #include "stdbool.h"
@@ -15,10 +18,6 @@ static uint8_t *bufptr;
 
 static uint8_t xor = 0;
 static uint16_t crc = 0xFFFF;
-
-static int cs_pin;
-
-#define UART uart1
 
 typedef enum
 {
@@ -46,39 +45,19 @@ static cmd_t in_flight = {
 };
 absolute_time_t timeout;
 
+#define BYTE_TRANSMISSION_DELAY_US(n_bits) (n_bits * 10 * 1000000 / 9600)
+
 const char *modbus_entity_prefix = "modbus";
+
+static const PIO pio = pio1;
+static const unsigned int tx_sm = 0;
+static const unsigned int rx_sm = 1;
 
 static inline void reset_buf()
 {
     bufptr = buf;
     xor = 0;
     crc = 0xFFFF;
-}
-
-void modbus_init(int tx_pin, int rx_pin, int cs)
-{
-
-    queue_init(&cmd_queue, queue_data, sizeof(cmd_t), QUEUE_DEPTH);
-
-    uart_init(UART, 9600);
-    coil_values = 0;
-
-    cs_pin = cs;
-    gpio_init(cs_pin);
-    gpio_set_dir(cs_pin, true);
-
-    // Without this, while driving the level floats, which can confuse the uart
-    gpio_pull_up(rx_pin);
-
-    // Set DE to 0 (Put it in receive mode)
-    gpio_put(cs_pin, 0);
-
-    gpio_set_function(tx_pin, GPIO_FUNC_UART);
-    gpio_set_function(rx_pin, GPIO_FUNC_UART);
-    reset_buf();
-    // The RS485 chip seems to need a little bit of start up time before it can receive commands after reboot.
-    // We put a sleep in here as a cheap way of ensuring that.
-    sleep_ms(1);
 }
 
 static void append(uint8_t val)
@@ -144,30 +123,20 @@ static void print_status(int index, bool is_on)
  */
 static bool bytes_available(size_t expected_sz)
 {
+    int c;
     do
     {
         if (bufptr - buf >= expected_sz)
         {
             return true;
         }
-        if (!uart_is_readable(UART))
+        if ((c = modbus_rx_program_getc(pio, rx_sm)) < 0)
         {
             return false;
         }
-        append(uart_getc(UART));
+        append(c);
     } while (true);
     return false; // Dead code
-}
-
-#define BYTE_TRANSMISSION_DELAY_US(n_bits) (n_bits * 10 * 1000000 / 9600)
-
-static inline void wait_for_transmission(int nbytes)
-{
-    // Wait for enough time for the transmission to occur
-    // TODO use hardware timer
-    sleep_until(make_timeout_time_us(BYTE_TRANSMISSION_DELAY_US(8)));
-    // Set DE back low, so that we can receive the response
-    gpio_put(cs_pin, 0);
 }
 
 static void send_set_coil(uint8_t devaddr, int coil_num, op_t val)
@@ -182,14 +151,8 @@ static void send_set_coil(uint8_t devaddr, int coil_num, op_t val)
     append(0x00);
     append_crc();
 
-    // Set DE to 1 (Write Mode)
-    gpio_put(cs_pin, 1);
+    modbus_tx_program_putbuf(pio, tx_sm, buf, 8);
 
-    // This could techically block, but we only write one thing at a time, and we've got a lock
-    // around it, so its _very_ unlikely as long as we write less than the Queue depth
-    uart_write_blocking(UART, buf, 8);
-
-    wait_for_transmission(8);
     switch (val)
     {
     case OP_CLEAR:
@@ -218,10 +181,8 @@ static void request_coil_status(int devaddr)
     append(0x00);
     append(0x20);
     append_crc();
-    gpio_put(cs_pin, 1);
-    // Technically this can block, but it probably won't (the FIFO is 32 bytes long)
-    uart_write_blocking(UART, buf, 8);
-    wait_for_transmission(8);
+    // Technically this can block, but it probably won't (the FIFO is 8 bytes long)
+    modbus_tx_program_putbuf(pio, tx_sm, buf, 8);
 }
 
 void modbus_enumerate()
@@ -274,15 +235,16 @@ void modbus_poll()
             {
                 printf("CRC mismatch on response\n");
             }
+            in_flight.op = OP_NONE;
         }
         else if (time_reached(timeout))
         {
             printf("Timeout receiving response from Modbus. Assuming no response will be forthcoming\n");
+            in_flight.op = OP_NONE;
         }
-        in_flight.op = OP_NONE;
     }
 
-    if (uart_is_writable(UART) && queue_get(&cmd_queue, &in_flight))
+    if (queue_get(&cmd_queue, &in_flight))
     {
         timeout = make_timeout_time_ms(1000); // Give the TX 1000 ms.
         switch (in_flight.op)
@@ -293,11 +255,37 @@ void modbus_poll()
             send_set_coil(in_flight.address, in_flight.coil, in_flight.op);
             break;
         case OP_FETCH:
+            request_coil_status(1);
             break;
         }
+        // We want the receive fifo to be completely empty - it should be, but its always good to be sure
+        while (!pio_sm_is_rx_fifo_empty(pio, rx_sm))
+        {
+            pio_sm_get(pio, rx_sm);
+        }
+
         // We expect to see a response in a handful of ms, but give it a bit longer, just in case.
         timeout = make_timeout_time_ms(100);
         // Reset read buffer for read.
         reset_buf();
     }
+}
+
+void modbus_init(int tx_pin, int rx_pin, int de_pin)
+{
+
+    queue_init(&cmd_queue, queue_data, sizeof(cmd_t), QUEUE_DEPTH);
+
+    uint offset = pio_add_program(pio, &modbus_tx_program);
+    modbus_tx_program_init(pio, tx_sm, offset, tx_pin, de_pin, 9600);
+    offset = pio_add_program(pio, &modbus_rx_program);
+    modbus_rx_program_init(pio, rx_sm, offset, rx_pin, 9600);
+
+    coil_values = 0;
+
+    reset_buf();
+
+    // The RS485 chip seems to need a little bit of start up time before it can receive commands after reboot.
+    // We put a sleep in here as a cheap way of ensuring that.
+    sleep_ms(1);
 }
