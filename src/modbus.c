@@ -145,9 +145,6 @@ static bool bytes_available(size_t expected_sz)
 
 static void send_set_coil(uint8_t devaddr, int coil_num, op_t val)
 {
-    log_i("Sending set_coil command");
-
-    // log_i("Setting device %d, coil %d to %d", devaddr, coil_num, val);
     reset_buf();
     append(devaddr);
     append(0x05);
@@ -173,14 +170,11 @@ static void send_set_coil(uint8_t devaddr, int coil_num, op_t val)
         coil_values ^= 1 << coil_num;
         break;
     }
-    // log_i("Printing status");
     print_status(coil_num, coil_values & (1 << coil_num));
 }
 
 static void request_coil_status(int devaddr)
 {
-    // log_i("Enumerating Modbus devices at address %d", devaddr);
-
     reset_buf();
     append(devaddr);
     append(0x01);

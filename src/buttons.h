@@ -14,7 +14,8 @@ typedef enum
 #define NUM_FIXTURES 24
 #define NUM_BUTTONS_PER_FIXTURE 7
 
-#define BUS_ADDRESS_MASK 0x3F
+// Mask for the bottom 6 bits, which should be the address on the bus.
+#define BINDING_ADDRESS_MASK 0x3F
 
 void buttons_init();
 void buttons_enumerate();

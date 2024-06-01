@@ -89,16 +89,6 @@ static void enumerate_got_max(int max, dali_cmd_t *cmd)
     };
     print_msg(&msg);
 
-    // log_i("\r\tdevice %s%d name=\"DALI light fixture %d\"", dali_entity_prefix, addr, addr);
-    // // If device is dimmable, add additional parameters to discovery line
-    // if (enumerate_min != max)
-    // {
-    //     log_i("\r\tlight %s%d device=%s%d brightness=true supported_color_modes=brightness brightness_scale=254 min=%d max=%d", dali_entity_prefix, addr, dali_entity_prefix, addr, enumerate_min, max);
-    // }
-    // else
-    // {
-    //     log_i("\r\tlight %s%d device=%s%d", dali_entity_prefix, addr, dali_entity_prefix, addr);
-    // }
     // Seperately enqueue a command to report the level, testing to see if it has faded.
     // We do this because, although unlikely, the device might have been mid-fade during the enumerate.
     report_level_with_fade(0, cmd);
@@ -181,7 +171,6 @@ static void toggle_action(int lvl, dali_cmd_t *cmd)
 
 void dali_init(uint32_t tx_pin, uint32_t rx_pin)
 {
-    // log_i("DALI TX pin %d, RX pin %d", tx_pin, rx_pin);
     // An enumeration will use 64 entries in the queue, so we give it some space.
     queue_init(&dali_queue, sizeof(dali_cmd_t), QUEUE_DEPTH);
 
@@ -273,7 +262,6 @@ void dali_set_level(int addr, int level)
 void dali_enumerate()
 {
     // First, see if the first address returns a level.  Callbacks will iterate the rest.
-    // log_i("Enumerating all DALI devices");
     enumerate_addr(0);
 }
 

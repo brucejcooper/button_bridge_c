@@ -40,7 +40,6 @@ static bool starts_with(const char *src, const char *prefix, char **after)
         *after = (char *)src + len;
         return true;
     }
-
     return false;
 }
 
@@ -237,20 +236,10 @@ static void process_cmd(char *cmd)
             printf("Invalid command\n");
         }
     }
-
-    // log_i("Finished processing");
 }
-
-// static volatile bool input_avail = false;
-
-// static void set_input_available(void *arg)
-// {
-//     input_avail = true;
-// }
 
 void cli_init()
 {
-    // stdio_set_chars_available_callback(set_input_available, NULL);
     queue_init(&output_queue, sizeof(log_msg_t), 200);
 }
 
@@ -262,10 +251,10 @@ static inline char *binding_tostr(uint8_t binding, char *out, size_t sz)
         strcpy(out, "none");
         break;
     case BINDING_TYPE_DALI:
-        snprintf(out, sz, "%s%d", dali_entity_prefix, binding & BUS_ADDRESS_MASK);
+        snprintf(out, sz, "%s%d", dali_entity_prefix, binding & BINDING_ADDRESS_MASK);
         break;
     case BINDING_TYPE_MODBUS:
-        snprintf(out, sz, "%s%d", modbus_entity_prefix, binding & BUS_ADDRESS_MASK);
+        snprintf(out, sz, "%s%d", modbus_entity_prefix, binding & BINDING_ADDRESS_MASK);
         break;
     default:
         snprintf(out, sz, "inv%08x", binding);

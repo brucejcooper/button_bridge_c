@@ -17,8 +17,6 @@
 
 #define MS_TO_COUNTDOWN(ms) (ms / 5)
 
-// Mask for the bottom 6 bits, which should be the address on the bus.
-
 // We are assuming 2MB of flash, and we use the last sector (4Kb).  The first two words will be magic values, then the rest will be bindings
 #define FLASH_CONFIG_OFFSET ((2 * 1024 * 1024) - FLASH_SECTOR_SIZE)
 static const uint8_t *bindings = (const uint8_t *)(XIP_BASE + FLASH_CONFIG_OFFSET);
@@ -125,7 +123,7 @@ static void button_timeout_check(button_ctx_t *ctx)
             switch (bindings[i] >> 6)
             {
             case BINDING_TYPE_DALI:
-                dali_fade(bindings[i] & BUS_ADDRESS_MASK, ctx->velocity);
+                dali_fade(bindings[i] & BINDING_ADDRESS_MASK, ctx->velocity);
                 break;
             default:
                 // log_i("binding %s is not dimmable", binding_tostr(bindings[i], tmpbuf));
@@ -147,11 +145,11 @@ static void button_released(button_ctx_t *ctx)
         {
         case BINDING_TYPE_DALI:
             // log_i("Toggling Dali");
-            dali_toggle(bindings[i] & BUS_ADDRESS_MASK);
+            dali_toggle(bindings[i] & BINDING_ADDRESS_MASK);
             break;
         case BINDING_TYPE_MODBUS:
             // log_i("Toggling Modbus");
-            modbus_set_coil(1, bindings[i] & BUS_ADDRESS_MASK, 2);
+            modbus_set_coil(1, bindings[i] & BINDING_ADDRESS_MASK, 2);
             break;
         default:
             log_button_evt(ctx, "not bound");

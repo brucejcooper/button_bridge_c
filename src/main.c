@@ -56,7 +56,7 @@ int main()
     stdio_init_all();
     cli_init();
 
-    // Upon restart, wait a bit, to give any processes that wish to attach to the CDC USB device a chance before we start printing
+    // Upon restart, wait a bit to give any processes that wish to attach to the CDC USB device a chance before we start printing
     sleep_ms(1000);
     printf("%s reset\n", watchdog_caused_reboot() ? "watchdog" : "normal");
 
