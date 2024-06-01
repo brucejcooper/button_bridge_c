@@ -10,7 +10,8 @@
 #include "stdint.h"
 #include <string.h>
 #include <stdio.h>
-#include "queue.h"
+#include <pico/util/queue.h>
+#include "cli.h"
 
 static uint32_t coil_values;
 static uint8_t buf[9];
@@ -33,12 +34,11 @@ typedef struct
     int address;
     int coil;
     op_t op;
-} cmd_t;
+} modbus_cmd_t;
 
 #define QUEUE_DEPTH 10
-static cmd_t queue_data[QUEUE_DEPTH];
 static queue_t cmd_queue;
-static cmd_t in_flight = {
+static modbus_cmd_t in_flight = {
     .address = 0,
     .coil = 0,
     .op = OP_NONE,
@@ -46,8 +46,6 @@ static cmd_t in_flight = {
 absolute_time_t timeout;
 
 #define BYTE_TRANSMISSION_DELAY_US(n_bits) (n_bits * 10 * 1000000 / 9600)
-
-const char *modbus_entity_prefix = "modbus";
 
 static const PIO pio = pio1;
 static const unsigned int tx_sm = 0;
@@ -115,7 +113,13 @@ static inline bool crc_is_valid()
 
 static void print_status(int index, bool is_on)
 {
-    printf("\r\t%s%d %s\n", modbus_entity_prefix, index, is_on ? "on" : "off");
+    log_msg_t msg = {
+        .type = STATUS_PRINT_VALUES,
+        .bus = MSG_SRC_MODBUS,
+        .device = 1,
+        .address = index,
+        .vals = {is_on, 0, 0}};
+    print_msg(&msg);
 }
 
 /**
@@ -141,6 +145,9 @@ static bool bytes_available(size_t expected_sz)
 
 static void send_set_coil(uint8_t devaddr, int coil_num, op_t val)
 {
+    log_i("Sending set_coil command");
+
+    // log_i("Setting device %d, coil %d to %d", devaddr, coil_num, val);
     reset_buf();
     append(devaddr);
     append(0x05);
@@ -166,12 +173,13 @@ static void send_set_coil(uint8_t devaddr, int coil_num, op_t val)
         coil_values ^= 1 << coil_num;
         break;
     }
+    // log_i("Printing status");
     print_status(coil_num, coil_values & (1 << coil_num));
 }
 
 static void request_coil_status(int devaddr)
 {
-    printf("Enumerating Modbus devices at address %d\n", devaddr);
+    // log_i("Enumerating Modbus devices at address %d", devaddr);
 
     reset_buf();
     append(devaddr);
@@ -187,21 +195,21 @@ static void request_coil_status(int devaddr)
 
 void modbus_enumerate()
 {
-    cmd_t cmd = {
+    modbus_cmd_t cmd = {
         .address = 1,
         .coil = 0,
         .op = OP_FETCH};
-    queue_add(&cmd_queue, &cmd);
+    queue_try_add(&cmd_queue, &cmd);
 }
 
 void modbus_set_coil(uint8_t devaddr, int coil_num, int val)
 {
-    cmd_t cmd = {
+    modbus_cmd_t cmd = {
         .address = devaddr,
         .coil = coil_num,
         .op = val,
     };
-    queue_add(&cmd_queue, &cmd);
+    queue_try_add(&cmd_queue, &cmd);
 }
 
 void modbus_poll()
@@ -209,6 +217,7 @@ void modbus_poll()
 
     if (in_flight.op != OP_NONE)
     {
+        // log_int("Waiting for bytes. Have", bufptr - buf);
         if (bytes_available(in_flight.op == OP_FETCH ? 9 : 8))
         {
             if (crc_is_valid())
@@ -218,34 +227,43 @@ void modbus_poll()
                 case OP_FETCH:
 
                     coil_values = (buf[3] << 24) | (buf[4] << 16) | (buf[5] << 8) | buf[6];
-                    printf("coils 0x%08x\n", coil_values);
+                    // log_i("coils 0x%08x", coil_values);
+
+                    log_msg_t msg = {
+                        .type = STATUS_PRINT_DEVICE,
+                        .bus = MSG_SRC_MODBUS,
+                        .device = 1,
+                        .vals = {0, 0, 0},
+                    };
 
                     for (int coil = 0; coil < 32; coil++)
                     {
-                        printf("\r\tdevice %s%d name=\"Modbus relay %d\"\n", modbus_entity_prefix, coil, coil);
-                        printf("\r\tswitch %s%d device=%s%d\n", modbus_entity_prefix, coil, modbus_entity_prefix, coil);
+                        msg.address = coil;
+                        print_msg(&msg);
                         print_status(coil, coil_values & (1 << coil));
                     }
                     break;
                 default:
-                    printf("Ignoring response from modbus set_coil op\n");
+                    log_i("Ignoring response from modbus set_coil op");
+                    break;
                 }
             }
             else
             {
-                printf("CRC mismatch on response\n");
+                log_i("CRC mismatch on response");
             }
             in_flight.op = OP_NONE;
         }
         else if (time_reached(timeout))
         {
-            printf("Timeout receiving response from Modbus. Assuming no response will be forthcoming\n");
+            log_i("nTimeout receiving response from Modbus. Assuming no response will be forthcoming");
             in_flight.op = OP_NONE;
         }
     }
 
-    if (queue_get(&cmd_queue, &in_flight))
+    if (queue_try_remove(&cmd_queue, &in_flight))
     {
+        pio_sm_restart(pio, tx_sm);
         timeout = make_timeout_time_ms(1000); // Give the TX 1000 ms.
         switch (in_flight.op)
         {
@@ -255,14 +273,12 @@ void modbus_poll()
             send_set_coil(in_flight.address, in_flight.coil, in_flight.op);
             break;
         case OP_FETCH:
+            log_i("Getting coil status");
             request_coil_status(1);
             break;
         }
         // We want the receive fifo to be completely empty - it should be, but its always good to be sure
-        while (!pio_sm_is_rx_fifo_empty(pio, rx_sm))
-        {
-            pio_sm_get(pio, rx_sm);
-        }
+        pio_sm_restart(pio, rx_sm);
 
         // We expect to see a response in a handful of ms, but give it a bit longer, just in case.
         timeout = make_timeout_time_ms(100);
@@ -274,7 +290,7 @@ void modbus_poll()
 void modbus_init(int tx_pin, int rx_pin, int de_pin)
 {
 
-    queue_init(&cmd_queue, queue_data, sizeof(cmd_t), QUEUE_DEPTH);
+    queue_init(&cmd_queue, sizeof(modbus_cmd_t), QUEUE_DEPTH);
 
     uint offset = pio_add_program(pio, &modbus_tx_program);
     modbus_tx_program_init(pio, tx_sm, offset, tx_pin, de_pin, 9600);

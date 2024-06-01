@@ -8,8 +8,6 @@
 #define DALI_TIMEOUT -2
 #define DALI_BUS_ERROR -3
 
-extern const char *dali_entity_prefix;
-
 void dali_init(uint32_t tx_pin, uint32_t rx_pin);
 void dali_poll();
 void dali_toggle(int addr);

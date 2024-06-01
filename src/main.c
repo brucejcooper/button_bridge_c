@@ -12,6 +12,7 @@
 #include "hardware/clocks.h"
 #include "hardware/structs/pll.h"
 #include "hardware/structs/clocks.h"
+#include <pico/util/queue.h>
 #include <string.h>
 #include "dali.h"
 #include "modbus.h"
@@ -53,27 +54,30 @@ int main()
                     48 * MHZ);
 
     stdio_init_all();
+    cli_init();
 
+    // Upon restart, wait a bit, to give any processes that wish to attach to the CDC USB device a chance before we start printing
     sleep_ms(1000);
     printf("%s reset\n", watchdog_caused_reboot() ? "watchdog" : "normal");
-    watchdog_enable(500, 1);
 
     dali_init(DALI_TX_PIN, DALI_RX_PIN);
     modbus_init(RS485_TX_PIN, RS485_RX_PIN, RS485_CS_PIN);
     buttons_init();
-    cli_init();
 
-    // At the start, enumerate all DALI devices.
+    // At the start, enumerate all devices.
     enumerate_all();
 
+    watchdog_enable(500, 1);
     for (;;)
     {
         buttons_poll();
         dali_poll();
         modbus_poll();
         cli_poll();
+
         watchdog_update();
     }
-
     return 0;
 }
+
+// modbus0 toggle

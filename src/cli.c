@@ -1,20 +1,36 @@
 #include "cli.h"
 #include <pico/stdlib.h>
+#include <stdarg.h>
 #include <hardware/regs/addressmap.h>
+#include "hardware/pll.h"
+#include "hardware/clocks.h"
 #include <hardware/regs/vreg_and_chip_reset.h>
 #include <hardware/structs/vreg_and_chip_reset.h>
+#include "hardware/structs/pll.h"
+#include "hardware/structs/clocks.h"
 #include <hardware/watchdog.h>
-#include <string.h>
+#include <pico/stdio.h>
 #include <stdio.h>
+#include <string.h>
 #include <ctype.h>
 #include <inttypes.h>
 #include "dali.h"
 #include "modbus.h"
 #include "buttons.h"
+#include <pico/util/queue.h>
+#include <stdio.h>
 
-#define MAX_COMMAND_LENGTH 40
+#define MAX_COMMAND_LENGTH 80
 static char input_buf[MAX_COMMAND_LENGTH];
 static char *input_ptr = input_buf;
+
+static queue_t output_queue;
+
+// Used as the prefix for all button fixture entities
+static const char *fixture_entity_prefix = "button_fixture";
+static const char *fixture_binding_postfix = ".binding";
+static const char *dali_entity_prefix = "dali";
+static const char *modbus_entity_prefix = "modbus";
 
 static bool starts_with(const char *src, const char *prefix, char **after)
 {
@@ -133,7 +149,7 @@ static bool process_set_binding_cmd(int fixture, int button, char *val)
         {
             return false;
         }
-        set_and_persist_binding(fixture, button, BUS_TYPE_DALI << 6 | address);
+        set_and_persist_binding(fixture, button, BINDING_TYPE_DALI << 6 | address);
     }
     else if (starts_with(val, modbus_entity_prefix, &after))
     {
@@ -142,7 +158,7 @@ static bool process_set_binding_cmd(int fixture, int button, char *val)
         {
             return false;
         }
-        set_and_persist_binding(fixture, button, BUS_TYPE_MODBUS << 6 | address);
+        set_and_persist_binding(fixture, button, BINDING_TYPE_MODBUS << 6 | address);
     }
     else if (strcmp(val, "none") == 0)
     {
@@ -173,25 +189,27 @@ static void process_cmd(char *cmd)
         }
         else if (strcmp(tok, "debug") == 0)
         {
-            printf("Reboot reason:");
-            if (vreg_and_chip_reset_hw->chip_reset & VREG_AND_CHIP_RESET_CHIP_RESET_HAD_POR_BITS)
-            {
-                printf("POR or BOD\n");
-            }
-            else if (vreg_and_chip_reset_hw->chip_reset & VREG_AND_CHIP_RESET_CHIP_RESET_HAD_RUN_BITS)
-            {
-                printf("Run Pin\n");
-            }
-            else if (vreg_and_chip_reset_hw->chip_reset & VREG_AND_CHIP_RESET_CHIP_RESET_HAD_PSM_RESTART_BITS)
-            {
-                printf("Debug Port\n");
-            }
-            else
-            {
-                printf("Unknown\n");
-            }
-
+            printf("Reboot reason: %x\n", vreg_and_chip_reset_hw->chip_reset);
             success = true;
+            uint f_pll_sys = frequency_count_khz(CLOCKS_FC0_SRC_VALUE_PLL_SYS_CLKSRC_PRIMARY);
+            uint f_pll_usb = frequency_count_khz(CLOCKS_FC0_SRC_VALUE_PLL_USB_CLKSRC_PRIMARY);
+            uint f_rosc = frequency_count_khz(CLOCKS_FC0_SRC_VALUE_ROSC_CLKSRC);
+            uint f_clk_sys = frequency_count_khz(CLOCKS_FC0_SRC_VALUE_CLK_SYS);
+            uint f_clk_ref = frequency_count_khz(CLOCKS_FC0_SRC_VALUE_CLK_REF);
+            uint f_clk_peri = frequency_count_khz(CLOCKS_FC0_SRC_VALUE_CLK_PERI);
+            uint f_clk_usb = frequency_count_khz(CLOCKS_FC0_SRC_VALUE_CLK_USB);
+            uint f_clk_adc = frequency_count_khz(CLOCKS_FC0_SRC_VALUE_CLK_ADC);
+            uint f_clk_rtc = frequency_count_khz(CLOCKS_FC0_SRC_VALUE_CLK_RTC);
+
+            printf("pll_sys  = %dkHz\n", f_pll_sys);
+            printf("pll_usb  = %dkHz\n", f_pll_usb);
+            printf("rosc     = %dkHz\n", f_rosc);
+            printf("clk_sys  = %dkHz\n", f_clk_sys);
+            printf("clk_peri = %dkHz\n", f_clk_peri);
+            printf("clk_ref  = %dkHz\n", f_clk_ref);
+            printf("clk_usb  = %dkHz\n", f_clk_usb);
+            printf("clk_adc  = %dkHz\n", f_clk_adc);
+            printf("clk_rtc  = %dkHz\n", f_clk_rtc);
         }
         else if (starts_with(tok, dali_entity_prefix, &after_prefix))
         {
@@ -220,17 +238,49 @@ static void process_cmd(char *cmd)
         }
     }
 
-    // printf("Finished processing\n");
+    // log_i("Finished processing");
 }
+
+// static volatile bool input_avail = false;
+
+// static void set_input_available(void *arg)
+// {
+//     input_avail = true;
+// }
 
 void cli_init()
 {
+    // stdio_set_chars_available_callback(set_input_available, NULL);
+    queue_init(&output_queue, sizeof(log_msg_t), 200);
+}
+
+static inline char *binding_tostr(uint8_t binding, char *out, size_t sz)
+{
+    switch (binding >> 6)
+    {
+    case BINDING_TYPE_NONE:
+        strcpy(out, "none");
+        break;
+    case BINDING_TYPE_DALI:
+        snprintf(out, sz, "%s%d", dali_entity_prefix, binding & BUS_ADDRESS_MASK);
+        break;
+    case BINDING_TYPE_MODBUS:
+        snprintf(out, sz, "%s%d", modbus_entity_prefix, binding & BUS_ADDRESS_MASK);
+        break;
+    default:
+        snprintf(out, sz, "inv%08x", binding);
+        break;
+    }
+    return out;
 }
 
 void cli_poll()
 {
     int c;
-    while ((c = getchar_timeout_us(0)) >= 0)
+    log_msg_t msg;
+    char tmpstr[16];
+
+    if ((c = getchar_timeout_us(0)) >= 0)
     {
         if (c == 0x04)
         {
@@ -264,4 +314,84 @@ void cli_poll()
             }
         }
     }
+
+    // See if there's any log messages to de-queue and print
+    // This will de-queue at most one at a time, so that the watchdog and other processes keep fed.
+    if (queue_try_remove(&output_queue, &msg))
+    {
+        switch (msg.type)
+        {
+        case STATUS_PRINT_DEVICE:
+            switch (msg.bus)
+            {
+            case MSG_SRC_DALI:
+                if (msg.vals[0] != msg.vals[1])
+                {
+                    printf("\r\tlight %s%d brightness=true supported_color_modes=brightness brightness_scale=254 min=%d max=%d\n", dali_entity_prefix, msg.address, msg.vals[0], msg.vals[1]);
+                }
+                else
+                {
+                    printf("\r\tlight %s%d\n", dali_entity_prefix, msg.address);
+                }
+                break;
+            case MSG_SRC_MODBUS:
+                printf("\r\tswitch %s%d\n", modbus_entity_prefix, msg.address);
+                break;
+            case MSG_SRC_BUTTON_FIXTURE:
+                printf("\r\ttext %s%d%s%d pattern=(none|%s(\\d|[1-2]\\d|3[01])|%s(\\d|[1-5]\\d|6[0-3]))\n", fixture_entity_prefix, msg.device, fixture_binding_postfix, msg.address, modbus_entity_prefix, dali_entity_prefix);
+                break;
+            default:
+                break;
+            }
+            break;
+        case STATUS_PRINT_VALUES:
+            switch (msg.bus)
+            {
+            case MSG_SRC_DALI:
+                printf("\r\t%s%d state=%s brightness=%d\n", dali_entity_prefix, msg.address, msg.vals[0] > 0 ? "on" : "off", msg.vals[0]);
+
+                break;
+            case MSG_SRC_MODBUS:
+                printf("\r\t%s%d %s\n", modbus_entity_prefix, msg.address, msg.vals[0] ? "on" : "off");
+                break;
+            case MSG_SRC_BUTTON_FIXTURE:
+                printf("\r\t%s%d%s%d %s\n", fixture_entity_prefix, msg.device, fixture_binding_postfix, msg.address, binding_tostr(msg.vals[0], tmpstr, sizeof(tmpstr)));
+
+                break;
+            default:
+                break;
+            }
+            break;
+
+        case STATUS_LOG:
+            printf("%s\n", msg.msg);
+            break;
+        case STATUS_LOGINT:
+            printf("%s %d\n", msg.msg, msg.vals[0]);
+            break;
+        }
+    }
+}
+
+void print_msg(log_msg_t *msg)
+{
+    queue_try_add(&output_queue, msg);
+}
+
+void log_i(char *c)
+{
+    log_msg_t msg = {
+        .type = STATUS_LOG,
+        .msg = c,
+    };
+    print_msg(&msg);
+}
+
+void log_int(char *c, int val)
+{
+    log_msg_t msg = {
+        .type = STATUS_LOGINT,
+        .msg = c,
+        .vals = {val, 0, 0}};
+    print_msg(&msg);
 }

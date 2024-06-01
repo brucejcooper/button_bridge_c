@@ -9,6 +9,7 @@
 #include "buttons.h"
 #include "dali.h"
 #include "modbus.h"
+#include "cli.h"
 
 #define BUTTON_SER_PIN 6
 #define BUTTON_CLK_PIN 7
@@ -17,7 +18,6 @@
 #define MS_TO_COUNTDOWN(ms) (ms / 5)
 
 // Mask for the bottom 6 bits, which should be the address on the bus.
-#define BUS_ADDRESS_MASK 0x3F
 
 // We are assuming 2MB of flash, and we use the last sector (4Kb).  The first two words will be magic values, then the rest will be bindings
 #define FLASH_CONFIG_OFFSET ((2 * 1024 * 1024) - FLASH_SECTOR_SIZE)
@@ -36,30 +36,6 @@ static int fixture = 0;
 static button_ctx_t *ctx = button_ctx;
 static absolute_time_t next_button_scan;
 
-// Used as the prefix for all button fixture entities
-const char *fixture_entity_prefix = "button_fixture";
-const char *fixture_binding_postfix = "_binding";
-
-static inline char *binding_tostr(uint8_t binding, char *out)
-{
-    switch (binding >> 6)
-    {
-    case BUS_TYPE_NONE:
-        strcpy(out, "none");
-        break;
-    case BUS_TYPE_DALI:
-        sprintf(out, "%s%d", dali_entity_prefix, binding & BUS_ADDRESS_MASK);
-        break;
-    case BUS_TYPE_MODBUS:
-        sprintf(out, "%s%d", modbus_entity_prefix, binding & BUS_ADDRESS_MASK);
-        break;
-    default:
-        sprintf(out, "inv%08x", binding);
-        break;
-    }
-    return out;
-}
-
 static void persist_bindings(uint8_t *sector)
 {
     uint32_t ints = save_and_disable_interrupts();
@@ -77,7 +53,7 @@ static void test_flash_config()
 
     if (memcmp(bindings + FLASH_PAGE_SIZE - 8, binding_magicvals, sizeof(binding_magicvals)) != 0)
     {
-        printf("Flash is not initialised - Blanking it out\n");
+        // log_i("Flash is not initialised - Blanking it out");
         uint8_t sector[FLASH_PAGE_SIZE];
         memcpy(sector + FLASH_PAGE_SIZE - sizeof(binding_magicvals), binding_magicvals, sizeof(binding_magicvals));
         memset(sector, 0xFF, FLASH_PAGE_SIZE - sizeof(binding_magicvals));
@@ -87,8 +63,15 @@ static void test_flash_config()
 
 static void print_binding_status(int fixture, int button)
 {
-    char tmpstr[16];
-    printf("\r\t%s%d%s%d %s\n", fixture_entity_prefix, fixture, fixture_binding_postfix, button, binding_tostr(bindings[fixture * NUM_BUTTONS_PER_FIXTURE + button], tmpstr));
+    log_msg_t msg = {
+        .type = STATUS_PRINT_VALUES,
+        .bus = MSG_SRC_BUTTON_FIXTURE,
+        .device = fixture,
+        .address = button,
+        .vals = bindings[fixture * NUM_BUTTONS_PER_FIXTURE + button],
+    };
+
+    print_msg(&msg);
 }
 
 void set_and_persist_binding(uint fixture, uint button, uint8_t encoded_binding)
@@ -104,7 +87,6 @@ void set_and_persist_binding(uint fixture, uint button, uint8_t encoded_binding)
 static void log_button_evt(button_ctx_t *ctx, char *evt)
 {
     int idx = ctx - button_ctx;
-    printf("%lu btn %d/%d %s\n", (time_us_32() / 1000), idx / NUM_BUTTONS_PER_FIXTURE, idx % NUM_BUTTONS_PER_FIXTURE, evt);
 }
 
 /**
@@ -142,11 +124,11 @@ static void button_timeout_check(button_ctx_t *ctx)
             int i = ctx - button_ctx;
             switch (bindings[i] >> 6)
             {
-            case BUS_TYPE_DALI:
+            case BINDING_TYPE_DALI:
                 dali_fade(bindings[i] & BUS_ADDRESS_MASK, ctx->velocity);
                 break;
             default:
-                printf("binding %s is not dimmable\n", binding_tostr(bindings[i], tmpbuf));
+                // log_i("binding %s is not dimmable", binding_tostr(bindings[i], tmpbuf));
                 break;
             }
         }
@@ -163,12 +145,12 @@ static void button_released(button_ctx_t *ctx)
 
         switch (bindings[i] >> 6)
         {
-        case BUS_TYPE_DALI:
-            printf("Toggling Dali\n");
+        case BINDING_TYPE_DALI:
+            // log_i("Toggling Dali");
             dali_toggle(bindings[i] & BUS_ADDRESS_MASK);
             break;
-        case BUS_TYPE_MODBUS:
-            printf("Toggling Modbus\n");
+        case BINDING_TYPE_MODBUS:
+            // log_i("Toggling Modbus");
             modbus_set_coil(1, bindings[i] & BUS_ADDRESS_MASK, 2);
             break;
         default:
@@ -185,16 +167,23 @@ static void button_released(button_ctx_t *ctx)
 
 void buttons_enumerate()
 {
-    for (int i = 0; i < NUM_FIXTURES * NUM_BUTTONS_PER_FIXTURE; i++)
+    log_msg_t msg = {
+        .type = STATUS_PRINT_DEVICE,
+        .bus = MSG_SRC_BUTTON_FIXTURE,
+    };
+
+    int i = 0;
+
+    for (int fixture = 0; fixture < NUM_FIXTURES; fixture++)
     {
-        int fixture = i / NUM_BUTTONS_PER_FIXTURE;
-        int button = i % NUM_BUTTONS_PER_FIXTURE;
-        if (button == 0)
+        msg.device = fixture;
+        for (int button = 0; button < NUM_BUTTONS_PER_FIXTURE; button++)
         {
-            printf("\r\tdevice %s%d name=\"Button Fixture %d\"\n", fixture_entity_prefix, fixture, fixture);
+            msg.address = button;
+
+            print_msg(&msg);
+            print_binding_status(fixture, button);
         }
-        printf("\r\ttext %s%d%s%d device=%s%d pattern=(none|%s(\\d|[1-2]\\d|3[01])|%s(\\d|[1-5]\\d|6[0-3]))\n", fixture_entity_prefix, fixture, fixture_binding_postfix, button, fixture_entity_prefix, fixture, modbus_entity_prefix, dali_entity_prefix);
-        print_binding_status(button, fixture);
     }
 }
 

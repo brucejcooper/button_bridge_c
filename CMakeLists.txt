@@ -8,7 +8,6 @@ add_executable(button_handler
    src/main.c
    src/dali.c
    src/modbus.c
-   src/queue.c
    src/buttons.c
    src/cli.c
 )

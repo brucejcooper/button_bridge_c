@@ -8,15 +8,13 @@ continuetx:
     pull                   ; stall with line in idle state
     set pins 1             ; set DE before we start transmitting.
     nop        side 1 [7]  ; Assert stop bit, plus DE high
-    set x, 7   side 0 [3]  ; Preload bit counter, assert start bit for 8 clocks
+    set x, 7   side 0 [7]  ; Preload bit counter, assert start bit for 8 clocks
 bitloop:                   ; This loop will run 8 times (8n1 UART)
-    nop               [3]
     out pins, 1            ; Shift 1 bit from OSR to the first OUT pin
-    jmp x-- bitloop   [2]  ; Each loop iteration is 8 cycles.
+    jmp x-- bitloop   [6]  ; Each loop iteration is 8 cycles.
     
-    out x, 1               ; Shift last bit. This is used to determine if its a TX end or not (1 ends transaction)
+    out x, 1   side 1      ; Shift last bit. This is used to determine if its a TX end or not (1 ends transaction)
     jmp !x continuetx      ; If we're not ending the transaction, jump back to the normal in transaction processing.
-    nop               [5]  ; Leave DE high for just a few usec longer
 
 
 
