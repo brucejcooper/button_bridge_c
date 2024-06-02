@@ -67,7 +67,7 @@ int main()
     // At the start, enumerate all devices.
     enumerate_all();
 
-    watchdog_enable(500, 1);
+    watchdog_enable(1000, 1);
     for (;;)
     {
         buttons_poll();

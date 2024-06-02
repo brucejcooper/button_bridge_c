@@ -36,7 +36,9 @@ typedef struct
     op_t op;
 } modbus_cmd_t;
 
+#define MODBUS_BAUD_RATE 9600
 #define QUEUE_DEPTH 10
+
 static queue_t cmd_queue;
 static modbus_cmd_t in_flight = {
     .address = 0,
@@ -100,24 +102,30 @@ static void append(uint8_t val)
     crc ^= table[xor];
 }
 
+/**
+ * When transmitting, we append the CRC that we caluclated each time we called append()
+ */
 static inline void append_crc()
 {
     *bufptr++ = crc & 0xFF;
     *bufptr++ = crc >> 8;
 }
 
+/**
+ * When receiving, the CRC calculation will end up 0 once a valid set of CRC values are appended.
+ */
 static inline bool crc_is_valid()
 {
     return crc == 0;
 }
 
-static void print_status(int index, bool is_on)
+static void print_status(int coil, bool is_on)
 {
     log_msg_t msg = {
         .type = STATUS_PRINT_VALUES,
         .bus = MSG_SRC_MODBUS,
         .device = 1,
-        .address = index,
+        .address = coil,
         .vals = {is_on, 0, 0}};
     print_msg(&msg);
 }
@@ -127,20 +135,16 @@ static void print_status(int index, bool is_on)
  */
 static bool bytes_available(size_t expected_sz)
 {
-    int c;
-    do
+    while (bufptr - buf < expected_sz)
     {
-        if (bufptr - buf >= expected_sz)
-        {
-            return true;
-        }
+        int c;
         if ((c = modbus_rx_program_getc(pio, rx_sm)) < 0)
         {
             return false;
         }
         append(c);
-    } while (true);
-    return false; // Dead code
+    }
+    return true;
 }
 
 static void send_set_coil(uint8_t devaddr, int coil_num, op_t val)
@@ -287,13 +291,11 @@ void modbus_init(int tx_pin, int rx_pin, int de_pin)
     queue_init(&cmd_queue, sizeof(modbus_cmd_t), QUEUE_DEPTH);
 
     uint offset = pio_add_program(pio, &modbus_tx_program);
-    modbus_tx_program_init(pio, tx_sm, offset, tx_pin, de_pin, 9600);
+    modbus_tx_program_init(pio, tx_sm, offset, tx_pin, de_pin, MODBUS_BAUD_RATE);
     offset = pio_add_program(pio, &modbus_rx_program);
-    modbus_rx_program_init(pio, rx_sm, offset, rx_pin, 9600);
+    modbus_rx_program_init(pio, rx_sm, offset, rx_pin, MODBUS_BAUD_RATE);
 
     coil_values = 0;
-
-    reset_buf();
 
     // The RS485 chip seems to need a little bit of start up time before it can receive commands after reboot.
     // We put a sleep in here as a cheap way of ensuring that.

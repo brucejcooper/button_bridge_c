@@ -28,7 +28,7 @@ static queue_t output_queue;
 
 // Used as the prefix for all button fixture entities
 static const char *fixture_entity_prefix = "button_fixture";
-static const char *fixture_binding_postfix = ".binding";
+static const char *fixture_binding_postfix = "_binding";
 static const char *dali_entity_prefix = "dali";
 static const char *modbus_entity_prefix = "modbus";
 
@@ -56,30 +56,97 @@ static bool process_dali_bus_cmd(char *cmd)
 
 static bool process_addressed_dali_bus_cmd(int addr, char *cmd)
 {
-    char *end;
-    int level = strtoimax(cmd, &end, 0);
-    if (*end == 0 && level >= 0 && level <= 254)
+    char *tok;
+    int onoff = -1;
+    int newlevel = -1;
+
+    while (*(tok = strsep(&cmd, " \t")))
     {
-        // It was a valid level
-        dali_set_level(addr, level);
+        char *key = strsep(&tok, "=");
+        if (*tok)
+        {
+
+            if (strcmp(key, "state") == 0)
+            {
+                if (strcmp(tok, "on") == 0)
+                {
+                    onoff = 1;
+                }
+                else if (strcmp(tok, "off") == 0)
+                {
+                    onoff = 0;
+                }
+                else if (strcmp(tok, "toggle") == 0)
+                {
+                    onoff = 2;
+                }
+                else
+                {
+                    return false;
+                }
+            }
+            else if (strcmp(key, "brightness") == 0)
+            {
+                char *end;
+                newlevel = strtoimax(tok, &end, 0);
+                if (*end)
+                {
+                    return false;
+                }
+            }
+            else
+            {
+                return false;
+            }
+        }
+        else
+        {
+            if (strcmp(key, "on") == 0)
+            {
+                onoff = 1;
+            }
+            else if (strcmp(key, "off") == 0)
+            {
+                onoff = 0;
+            }
+            else if (strcmp(key, "toggle") == 0)
+            {
+                onoff = 2;
+            }
+            else
+            {
+                newlevel = strtoimax(key, &tok, 0);
+                if (*tok)
+                {
+                    return false;
+                }
+            }
+        }
     }
-    else if (strcmp(cmd, "on") == 0)
+
+    if (newlevel >= 0 && newlevel <= 254)
     {
-        dali_set_on(addr, 1);
+        printf("Setting dali[%d] level to %d\n", addr, newlevel);
+        dali_set_level(addr, newlevel);
+        return true;
     }
-    else if (strcmp(cmd, "off") == 0)
+    else if (onoff != -1)
     {
-        dali_set_on(addr, 0);
+        if (onoff == 2)
+        {
+            printf("Toggling DALI[%d]\n", addr);
+
+            dali_toggle(addr);
+            return true;
+        }
+        else
+        {
+            printf("setting DALI[%d] onoff to %d\n", addr, onoff);
+            dali_set_on(addr, onoff);
+            return true;
+        }
     }
-    else if (strcmp(cmd, "toggle") == 0)
-    {
-        dali_toggle(addr);
-    }
-    else
-    {
-        return false;
-    }
-    return true;
+    return false;
 }
 
 static bool process_addressed_modbus_cmd(int addr, char *cmd)
@@ -240,7 +307,9 @@ static void process_cmd(char *cmd)
 
 void cli_init()
 {
-    queue_init(&output_queue, sizeof(log_msg_t), 200);
+    // When we enumerate, we can add 168 * 2 + 32 x 2 + 64 * 2 = 528.  We don't want the queue to overflow, so give it a bunch of space
+    // That is a lot of messages!
+    queue_init(&output_queue, sizeof(log_msg_t), 800);
 }
 
 static inline char *binding_tostr(uint8_t binding, char *out, size_t sz)
@@ -316,18 +385,18 @@ void cli_poll()
             case MSG_SRC_DALI:
                 if (msg.vals[0] != msg.vals[1])
                 {
-                    printf("\r\tlight %s%d brightness=true supported_color_modes=brightness brightness_scale=254 min=%d max=%d\n", dali_entity_prefix, msg.address, msg.vals[0], msg.vals[1]);
+                    printf("\r\tlight %s%d name=\"DALI light %d\" brightness=true supported_color_modes=brightness brightness_scale=254 min=%d max=%d\n", dali_entity_prefix, msg.address, msg.address, msg.vals[0], msg.vals[1]);
                 }
                 else
                 {
-                    printf("\r\tlight %s%d\n", dali_entity_prefix, msg.address);
+                    printf("\r\tlight %s%d name=\"DALI light %d\"\n", dali_entity_prefix, msg.address, msg.address);
                 }
                 break;
             case MSG_SRC_MODBUS:
-                printf("\r\tswitch %s%d\n", modbus_entity_prefix, msg.address);
+                printf("\r\tswitch %s%d name=\"MODBUS relay %d\"\n", modbus_entity_prefix, msg.address, msg.address);
                 break;
             case MSG_SRC_BUTTON_FIXTURE:
-                printf("\r\ttext %s%d%s%d pattern=(none|%s(\\d|[1-2]\\d|3[01])|%s(\\d|[1-5]\\d|6[0-3]))\n", fixture_entity_prefix, msg.device, fixture_binding_postfix, msg.address, modbus_entity_prefix, dali_entity_prefix);
+                printf("\r\ttext %s%d%s%d name=\"Binding %d\" pattern=\"(none|%s(\\d|[1-2]\\d|3[01])|%s(\\d|[1-5]\\d|6[0-3]))\"\n", fixture_entity_prefix, msg.device, fixture_binding_postfix, msg.address, msg.address, modbus_entity_prefix, dali_entity_prefix);
                 break;
             default:
                 break;
@@ -337,11 +406,11 @@ void cli_poll()
             switch (msg.bus)
             {
             case MSG_SRC_DALI:
-                printf("\r\t%s%d state=%s brightness=%d\n", dali_entity_prefix, msg.address, msg.vals[0] > 0 ? "on" : "off", msg.vals[0]);
+                printf("\r\t%s%d state=%s brightness=%d\n", dali_entity_prefix, msg.address, msg.vals[0] > 0 ? "ON" : "OFF", msg.vals[0]);
 
                 break;
             case MSG_SRC_MODBUS:
-                printf("\r\t%s%d %s\n", modbus_entity_prefix, msg.address, msg.vals[0] ? "on" : "off");
+                printf("\r\t%s%d %s\n", modbus_entity_prefix, msg.address, msg.vals[0] ? "ON" : "OFF");
                 break;
             case MSG_SRC_BUTTON_FIXTURE:
                 printf("\r\t%s%d%s%d %s\n", fixture_entity_prefix, msg.device, fixture_binding_postfix, msg.address, binding_tostr(msg.vals[0], tmpstr, sizeof(tmpstr)));
@@ -359,6 +428,7 @@ void cli_poll()
             printf("%s %d\n", msg.msg, msg.vals[0]);
             break;
         }
+        fflush(stdout);
     }
 }
 
