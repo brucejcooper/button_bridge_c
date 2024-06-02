@@ -213,7 +213,7 @@ class SerialMqttBridge:
             self._mqtt_client.publish(self._availability_topic, "online", retain=True)
         
         # Request that the devices enumerate themselves    
-        # self.enumerate_devices()
+        self.enumerate_devices()
 
 
     def on_disconnect(self, client, userdata, flags, reason_code, properties):
