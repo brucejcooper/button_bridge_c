@@ -1,6 +1,8 @@
 {
     "files.associations": {
         "queue.h": "c",
-        "clocks.h": "c"
+        "clocks.h": "c",
+        "sync.h": "c",
+        "critical_section.h": "c"
     }
 }

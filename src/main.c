@@ -13,6 +13,8 @@
 #include "hardware/structs/pll.h"
 #include "hardware/structs/clocks.h"
 #include <pico/util/queue.h>
+#include <pico/multicore.h>
+#include <pico/sync.h>
 #include <string.h>
 #include "dali.h"
 #include "modbus.h"
@@ -31,6 +33,10 @@ void enumerate_all()
     dali_enumerate();
     modbus_enumerate();
     buttons_enumerate();
+}
+
+void scan_loop()
+{
 }
 
 int main()
@@ -74,7 +80,6 @@ int main()
         dali_poll();
         modbus_poll();
         cli_poll();
-
         watchdog_update();
     }
     return 0;

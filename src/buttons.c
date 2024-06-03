@@ -17,9 +17,14 @@
 
 #define MS_TO_COUNTDOWN(ms) (ms / 5)
 
-// We are assuming 2MB of flash, and we use the last sector (4Kb).  The first two words will be magic values, then the rest will be bindings
+// We are assuming 2MB of flash, and we use the last sector (4Kb).  The very last value will be set to a magic value.
 #define FLASH_CONFIG_OFFSET ((2 * 1024 * 1024) - FLASH_SECTOR_SIZE)
-static const uint8_t *bindings = (const uint8_t *)(XIP_BASE + FLASH_CONFIG_OFFSET);
+
+// This must be at least NUM_FIXTURES * NUM_BUTTONS_PER_FIXTURE + 1
+#define NUM_BINDINGS 256
+// Must be a multiple of 256 (the flash PAGE size) - Ensure that NUM_BINDINGS is set so that this is true.
+#define CONFIG_SZ (NUM_BINDINGS * sizeof(uint32_t))
+static const uint32_t *bindings = (const uint32_t *)(XIP_BASE + FLASH_CONFIG_OFFSET);
 
 // Trying to use as little memory as possible (when we transition to CH559), we cram stuff together - 2 bytes per switch x 168 is pretty good.
 typedef struct
@@ -34,11 +39,48 @@ static int fixture = 0;
 static button_ctx_t *ctx = button_ctx;
 static absolute_time_t next_button_scan;
 
-static void persist_bindings(uint8_t *sector)
+critical_section_t binding_access_lock;
+
+uint32_t encode_binding(binding_t *binding)
 {
+    uint32_t v = binding->type << 24 | (binding->device & 0xFF) << 16 | (binding->address & 0xFFFF);
+
+    return v;
+}
+
+static inline void lock()
+{
+    critical_section_enter_blocking(&binding_access_lock);
+}
+
+static inline void unlock()
+{
+    critical_section_exit(&binding_access_lock);
+}
+
+void get_binding_at_index(uint index, binding_t *binding)
+{
+    lock();
+    decode_binding(bindings[index], binding);
+    unlock();
+}
+
+void decode_binding(uint32_t encoded, binding_t *binding)
+{
+    binding->type = encoded >> 24;
+    binding->device = (encoded >> 16) & 0xFF;
+    binding->address = encoded & 0xFFFF;
+}
+
+#define MAGIC_VALUE ('M' << 24 | 'E' << 16 | 'C' << 8 | 'H')
+
+static void persist_bindings(uint32_t sector[NUM_BINDINGS])
+{
+    sector[NUM_BINDINGS - 1] = MAGIC_VALUE;
+    fflush(stdout);
     uint32_t ints = save_and_disable_interrupts();
-    flash_range_erase(FLASH_CONFIG_OFFSET, FLASH_SECTOR_SIZE);
-    flash_range_program(FLASH_CONFIG_OFFSET, sector, FLASH_PAGE_SIZE);
+    flash_range_erase(FLASH_CONFIG_OFFSET, FLASH_SECTOR_SIZE); // Must always erase entire sectors
+    flash_range_program(FLASH_CONFIG_OFFSET, (const uint8_t *)sector, CONFIG_SZ);
     restore_interrupts(ints);
 }
 
@@ -47,38 +89,50 @@ static void persist_bindings(uint8_t *sector)
  */
 static void test_flash_config()
 {
-    static const char binding_magicvals[8] = "MechCFG1";
-
-    if (memcmp(bindings + FLASH_PAGE_SIZE - 8, binding_magicvals, sizeof(binding_magicvals)) != 0)
+    lock();
+    binding_t binding = {
+        .type = BINDING_TYPE_NONE,
+        .device = 0,
+        .address = 0,
+    };
+    if (bindings[NUM_BINDINGS - 1] != MAGIC_VALUE)
     {
-        // log_i("Flash is not initialised - Blanking it out");
-        uint8_t sector[FLASH_PAGE_SIZE];
-        memcpy(sector + FLASH_PAGE_SIZE - sizeof(binding_magicvals), binding_magicvals, sizeof(binding_magicvals));
-        memset(sector, 0xFF, FLASH_PAGE_SIZE - sizeof(binding_magicvals));
+        uint32_t sector[NUM_BINDINGS];
+        for (int i = 0; i < NUM_BINDINGS - 1; i++)
+        {
+            sector[i] = encode_binding(&binding);
+        }
         persist_bindings(sector);
     }
+    unlock();
 }
 
 static void print_binding_status(int fixture, int button)
 {
+    lock();
     log_msg_t msg = {
         .type = STATUS_PRINT_VALUES,
         .bus = MSG_SRC_BUTTON_FIXTURE,
         .device = fixture,
         .address = button,
-        .vals = bindings[fixture * NUM_BUTTONS_PER_FIXTURE + button],
+        .vals = {(int32_t)bindings[fixture * NUM_BUTTONS_PER_FIXTURE + button], 0, 0},
     };
+    unlock();
 
     print_msg(&msg);
 }
 
-void set_and_persist_binding(uint fixture, uint button, uint8_t encoded_binding)
+void set_and_persist_binding(uint fixture, uint button, binding_t *binding)
 {
+
     assert(fixture < NUM_FIXTURES && button < NUM_BUTTONS_PER_FIXTURE);
-    uint8_t sector[FLASH_PAGE_SIZE];
-    memcpy(sector, bindings, FLASH_PAGE_SIZE);
-    sector[fixture * NUM_BUTTONS_PER_FIXTURE + button] = encoded_binding;
+    uint32_t sector[NUM_BINDINGS];
+    memcpy(sector, bindings, NUM_BINDINGS * sizeof(uint32_t));
+    sector[fixture * NUM_BUTTONS_PER_FIXTURE + button] = encode_binding(binding);
+
+    lock();
     persist_bindings(sector);
+    unlock();
     print_binding_status(fixture, button);
 }
 
@@ -102,7 +156,8 @@ static void button_pressed(button_ctx_t *ctx)
 
 static void button_timeout_check(button_ctx_t *ctx)
 {
-    char tmpbuf[16];
+    binding_t binding;
+
     if (ctx->countdown && --(ctx->countdown) == 0)
     {
         if (ctx->released)
@@ -117,17 +172,13 @@ static void button_timeout_check(button_ctx_t *ctx)
                 // Set it to dimming downwards - Clear the DIMDIR bit and set the DIMMING bit
                 ctx->velocity = -1;
             }
+            get_binding_at_index(ctx - button_ctx, &binding);
 
-            log_button_evt(ctx, ctx->velocity > 0 ? "brighten" : "dim");
-            int i = ctx - button_ctx;
-            switch (bindings[i] >> 6)
+            // Only DALI devices are dimmable
+            if (binding.type == BINDING_TYPE_DALI)
             {
-            case BINDING_TYPE_DALI:
-                dali_fade(bindings[i] & BINDING_ADDRESS_MASK, ctx->velocity);
-                break;
-            default:
-                // log_i("binding %s is not dimmable", binding_tostr(bindings[i], tmpbuf));
-                break;
+                log_button_evt(ctx, ctx->velocity > 0 ? "brighten" : "dim");
+                dali_fade(binding.address, ctx->velocity);
             }
         }
     }
@@ -135,21 +186,24 @@ static void button_timeout_check(button_ctx_t *ctx)
 
 static void button_released(button_ctx_t *ctx)
 {
-    int i = ctx - button_ctx;
+    binding_t binding;
+    get_binding_at_index(ctx - button_ctx, &binding);
 
     if (ctx->velocity == 0)
     {
-        log_button_evt(ctx, "clicked");
+        log_int("clicked button", ctx - button_ctx);
 
-        switch (bindings[i] >> 6)
+        switch (binding.type)
         {
         case BINDING_TYPE_DALI:
             // log_i("Toggling Dali");
-            dali_toggle(bindings[i] & BINDING_ADDRESS_MASK);
+            log_int("Toggling DALI:", binding.address);
+            dali_toggle(binding.address);
             break;
         case BINDING_TYPE_MODBUS:
             // log_i("Toggling Modbus");
-            modbus_set_coil(1, bindings[i] & BINDING_ADDRESS_MASK, 2);
+            log_int("Toggling MODBUS:", binding.address);
+            modbus_set_coil(1, binding.address, 2);
             break;
         default:
             log_button_evt(ctx, "not bound");
@@ -187,6 +241,8 @@ void buttons_enumerate()
 
 void buttons_init()
 {
+    critical_section_init(&binding_access_lock);
+
     test_flash_config();
 
     for (int i = 0; i < NUM_BUTTONS_PER_FIXTURE; i++)

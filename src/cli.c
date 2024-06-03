@@ -54,7 +54,7 @@ static bool process_dali_bus_cmd(char *cmd)
     return false;
 }
 
-static bool process_addressed_dali_bus_cmd(int addr, char *cmd)
+static bool process_addressed_dali_bus_cmd(int bus, int addr, char *cmd)
 {
     char *tok;
     int onoff = -1;
@@ -149,19 +149,19 @@ static bool process_addressed_dali_bus_cmd(int addr, char *cmd)
     return false;
 }
 
-static bool process_addressed_modbus_cmd(int addr, char *cmd)
+static bool process_addressed_modbus_cmd(int device, int addr, char *cmd)
 {
     if (strcmp(cmd, "on") == 0)
     {
-        modbus_set_coil(1, addr, 1);
+        modbus_set_coil(device, addr, 1);
     }
     else if (strcmp(cmd, "off") == 0)
     {
-        modbus_set_coil(1, addr, 0);
+        modbus_set_coil(device, addr, 0);
     }
     else if (strcmp(cmd, "toggle") == 0)
     {
-        modbus_set_coil(1, addr, 2);
+        modbus_set_coil(device, addr, 2);
     }
     else
     {
@@ -179,13 +179,18 @@ static bool process_dali_cmd(char *entityid, char *cmd)
     else
     {
         char *end;
-        int address = strtoimax(entityid, &end, 0);
-        if (*end != 0 || address < 0 || address >= 64)
+        int idnum = strtoimax(entityid, &end, 10);
+        if (*end == 0)
         {
-            return false;
-        }
+            int device = idnum / 100;
+            int address = idnum % 100;
 
-        return process_addressed_dali_bus_cmd(address, cmd);
+            if (device < 1 && device > 1 && address < 0 | address >= 64)
+            {
+                return false;
+            }
+            return process_addressed_dali_bus_cmd(device, address, cmd);
+        }
     }
     return false;
 }
@@ -195,46 +200,64 @@ static bool process_modbus_cmd(char *entityid, char *cmd)
     if (*entityid != 0)
     {
         char *end;
-        int address = strtoimax(entityid, &end, 0);
-        if (*end != 0 || address < 0 || address >= 32)
+        int id = strtoimax(entityid, &end, 10);
+        if (*end == 0)
         {
-            return false;
+            int device = id / 100;
+            int address = id % 100;
+            if (device < 1 || device > 1 || address < 0 || address > 32)
+            {
+                return false;
+            }
+            return process_addressed_modbus_cmd(device, address, cmd);
         }
-        return process_addressed_modbus_cmd(address, cmd);
     }
     return false;
 }
 
 static bool process_set_binding_cmd(int fixture, int button, char *val)
 {
+    int address_min = 0;
+    int address_max;
+    bool has_address = true;
+    binding_t binding = {
+        .type = BINDING_TYPE_NONE,
+        .device = 0,
+        .address = 0,
+    };
+
     char *after;
     if (starts_with(val, dali_entity_prefix, &after))
     {
-        int address = strtoimax(after, &after, 10);
-        if (*after != 0 || address < 0 || address >= 64)
-        {
-            return false;
-        }
-        set_and_persist_binding(fixture, button, BINDING_TYPE_DALI << 6 | address);
+        binding.type = BINDING_TYPE_DALI;
+        address_max = 63;
     }
     else if (starts_with(val, modbus_entity_prefix, &after))
     {
-        int address = strtoimax(after, &after, 10);
-        if (*after != 0 || address < 0 || address >= 32)
-        {
-            return false;
-        }
-        set_and_persist_binding(fixture, button, BINDING_TYPE_MODBUS << 6 | address);
+        binding.type = BINDING_TYPE_MODBUS;
+        address_max = 31;
     }
     else if (strcmp(val, "none") == 0)
     {
-        set_and_persist_binding(fixture, button, 0xFF);
+        binding.type = BINDING_TYPE_NONE;
+        has_address = false;
     }
     else
     {
         return false;
     }
 
+    if (has_address)
+    {
+        int id = strtoimax(after, &after, 10);
+        binding.device = id / 100;
+        binding.address = id % 100;
+        if (*after != 0 || binding.address < address_min || binding.address > address_max)
+        {
+            return false;
+        }
+    }
+    set_and_persist_binding(fixture, button, &binding);
     return true;
 }
 
@@ -312,23 +335,27 @@ void cli_init()
     queue_init(&output_queue, sizeof(log_msg_t), 800);
 }
 
-static inline char *binding_tostr(uint8_t binding, char *out, size_t sz)
+static inline char *binding_tostr(uint32_t encoded, char *out, size_t sz)
 {
-    switch (binding >> 6)
+    binding_t binding;
+    decode_binding(encoded, &binding);
+    const char *typestr;
+
+    switch (binding.type)
     {
     case BINDING_TYPE_NONE:
         strcpy(out, "none");
-        break;
+        return out;
     case BINDING_TYPE_DALI:
-        snprintf(out, sz, "%s%d", dali_entity_prefix, binding & BINDING_ADDRESS_MASK);
+        typestr = dali_entity_prefix;
         break;
     case BINDING_TYPE_MODBUS:
-        snprintf(out, sz, "%s%d", modbus_entity_prefix, binding & BINDING_ADDRESS_MASK);
+        typestr = modbus_entity_prefix;
         break;
     default:
-        snprintf(out, sz, "inv%08x", binding);
-        break;
+        typestr = "inv";
     }
+    snprintf(out, sz, "%s%02d%02d", typestr, binding.device, binding.address);
     return out;
 }
 
@@ -385,18 +412,19 @@ void cli_poll()
             case MSG_SRC_DALI:
                 if (msg.vals[0] != msg.vals[1])
                 {
-                    printf("\r\tlight %s%d name=\"DALI light %d\" brightness=true supported_color_modes=brightness brightness_scale=254 min=%d max=%d\n", dali_entity_prefix, msg.address, msg.address, msg.vals[0], msg.vals[1]);
+                    printf("\r\tlight %s%02d%02d devname=\"DALI bus %d addr %d\" brightness=true supported_color_modes=brightness brightness_scale=254 min=%d max=%d\n", dali_entity_prefix, msg.device, msg.address, msg.device, msg.address, msg.vals[0], msg.vals[1]);
                 }
                 else
                 {
-                    printf("\r\tlight %s%d name=\"DALI light %d\"\n", dali_entity_prefix, msg.address, msg.address);
+                    printf("\r\tlight %s%02d%02d devname=\"DALI %d/%d\"\n", dali_entity_prefix, msg.device, msg.address, msg.device, msg.address);
                 }
                 break;
             case MSG_SRC_MODBUS:
-                printf("\r\tswitch %s%d name=\"MODBUS relay %d\"\n", modbus_entity_prefix, msg.address, msg.address);
+                printf("\r\tswitch %s%02d%02d name=\"relay\" devname=\"Modbus %d/%d\"\n", modbus_entity_prefix, msg.device, msg.address, msg.device, msg.address);
                 break;
             case MSG_SRC_BUTTON_FIXTURE:
-                printf("\r\ttext %s%d%s%d name=\"Binding %d\" pattern=\"(none|%s(\\d|[1-2]\\d|3[01])|%s(\\d|[1-5]\\d|6[0-3]))\"\n", fixture_entity_prefix, msg.device, fixture_binding_postfix, msg.address, msg.address, modbus_entity_prefix, dali_entity_prefix);
+                printf("\r\ttext %s%d%s%d name=\"Binding %d\" devid=button_fixture%d devname=\"Button Fixture %d\" pattern=\"(none|%s\\d{4}|%s\\d{4})\"\n",
+                       fixture_entity_prefix, msg.device, fixture_binding_postfix, msg.address, msg.address, msg.device, msg.device, modbus_entity_prefix, dali_entity_prefix);
                 break;
             default:
                 break;
@@ -406,14 +434,14 @@ void cli_poll()
             switch (msg.bus)
             {
             case MSG_SRC_DALI:
-                printf("\r\t%s%d state=%s brightness=%d\n", dali_entity_prefix, msg.address, msg.vals[0] > 0 ? "ON" : "OFF", msg.vals[0]);
+                printf("\r\t%s%02d%02d state=%s brightness=%d\n", dali_entity_prefix, msg.device, msg.address, msg.vals[0] > 0 ? "ON" : "OFF", msg.vals[0]);
 
                 break;
             case MSG_SRC_MODBUS:
-                printf("\r\t%s%d %s\n", modbus_entity_prefix, msg.address, msg.vals[0] ? "ON" : "OFF");
+                printf("\r\t%s%02d%02d %s\n", modbus_entity_prefix, msg.device, msg.address, msg.vals[0] ? "ON" : "OFF");
                 break;
             case MSG_SRC_BUTTON_FIXTURE:
-                printf("\r\t%s%d%s%d %s\n", fixture_entity_prefix, msg.device, fixture_binding_postfix, msg.address, binding_tostr(msg.vals[0], tmpstr, sizeof(tmpstr)));
+                printf("\r\t%s%d%s%d %s\n", fixture_entity_prefix, msg.device, fixture_binding_postfix, msg.address, binding_tostr((uint32_t)msg.vals[0], tmpstr, sizeof(tmpstr)));
 
                 break;
             default:
@@ -428,7 +456,7 @@ void cli_poll()
             printf("%s %d\n", msg.msg, msg.vals[0]);
             break;
         }
-        fflush(stdout);
+        stdio_flush();
     }
 }
 

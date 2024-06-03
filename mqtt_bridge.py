@@ -162,16 +162,19 @@ class SerialMqttBridge:
             
             entity_unique_id = f"{self.client_id}_{entity_id}"
             
-            last_underscore = entity_id.rfind('_')
-            if last_underscore != -1:
-                devid = entity_id[0:last_underscore]
+            if "devid" in values:
+                devid = values.get("devid")
             else:
-                devid = entity_id
+                last_underscore = entity_id.rfind('_')
+                if last_underscore != -1:
+                    devid = entity_id[0:last_underscore]
+                else:
+                    devid = entity_id
             
             topic_prefix = f"mechination/{self.client_id}/{entity_id}"
             msg =  {
                 "unique_id": entity_unique_id,
-                "object_id": entity_id,
+                "object_id": entity_id,                
                 "state_topic": topic_prefix,
                 "command_topic": topic_prefix + "/set", 
                 "availability": [
@@ -185,12 +188,18 @@ class SerialMqttBridge:
                     "identifiers": [
                         f"{self.client_id}-{devid}"
                     ],
-                    "name": self.infer_devname(devid)
+                    "name": values.get("devname", None) or self.infer_devname(devid)
                 }
             }
             if type == 'light':
                 msg['schema'] = 'json'
+            if "devname" in values:
+                del values["devname"]
+            if "devid" in values:
+                del values["devid"]
             msg.update(values)
+            if not "name" in msg:
+                msg["name"] = type
             
             self._send_to_mqtt(f"homeassistant/{type}/{self.client_id}/{entity_id}/config", json.dumps(msg))
 
