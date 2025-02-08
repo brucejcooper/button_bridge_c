@@ -1,13 +1,9 @@
 #include "cli.h"
 #include <pico/stdlib.h>
-#include <stdarg.h>
 #include <hardware/regs/addressmap.h>
-#include "hardware/pll.h"
 #include "hardware/clocks.h"
 #include <hardware/regs/vreg_and_chip_reset.h>
 #include <hardware/structs/vreg_and_chip_reset.h>
-#include "hardware/structs/pll.h"
-#include "hardware/structs/clocks.h"
 #include <hardware/watchdog.h>
 #include <pico/stdio.h>
 #include <stdio.h>
@@ -23,8 +19,6 @@
 #define MAX_COMMAND_LENGTH 80
 static char input_buf[MAX_COMMAND_LENGTH];
 static char *input_ptr = input_buf;
-
-static queue_t output_queue;
 
 // Used as the prefix for all button fixture entities
 static const char *fixture_entity_prefix = "button_fixture";
@@ -215,6 +209,7 @@ static bool process_modbus_cmd(char *entityid, char *cmd)
     return false;
 }
 
+
 static bool process_set_binding_cmd(int fixture, int button, char *val)
 {
     int address_min = 0;
@@ -276,7 +271,8 @@ static void process_cmd(char *cmd)
             enumerate_all();
             success = true;
         }
-        else if (strcmp(tok, "debug") == 0)
+        else 
+        if (strcmp(tok, "debug") == 0)
         {
             printf("Reboot reason: %x\n", vreg_and_chip_reset_hw->chip_reset);
             success = true;
@@ -321,18 +317,15 @@ static void process_cmd(char *cmd)
                 }
             }
         }
-        if (!success)
-        {
-            printf("Invalid command\n");
-        }
+    }
+    if (!success)
+    {
+        printf("Invalid command\n");
     }
 }
 
 void cli_init()
 {
-    // When we enumerate, we can add 168 * 2 + 32 x 2 + 64 * 2 = 528.  We don't want the queue to overflow, so give it a bunch of space
-    // That is a lot of messages!
-    queue_init(&output_queue, sizeof(log_msg_t), 800);
 }
 
 static inline char *binding_tostr(uint32_t encoded, char *out, size_t sz)
@@ -362,10 +355,9 @@ static inline char *binding_tostr(uint32_t encoded, char *out, size_t sz)
 void cli_poll()
 {
     int c;
-    log_msg_t msg;
     char tmpstr[16];
 
-    if ((c = getchar_timeout_us(0)) >= 0)
+    if ((c = getchar_timeout_us(100)) >= 0)
     {
         if (c == 0x04)
         {
@@ -400,85 +392,4 @@ void cli_poll()
         }
     }
 
-    // See if there's any log messages to de-queue and print
-    // This will de-queue at most one at a time, so that the watchdog and other processes keep fed.
-    if (queue_try_remove(&output_queue, &msg))
-    {
-        switch (msg.type)
-        {
-        case STATUS_PRINT_DEVICE:
-            switch (msg.bus)
-            {
-            case MSG_SRC_DALI:
-                if (msg.vals[0] != msg.vals[1])
-                {
-                    printf("\r\tlight %s%02d%02d devname=\"DALI bus %d addr %d\" brightness=true supported_color_modes=brightness brightness_scale=254 min=%d max=%d\n", dali_entity_prefix, msg.device, msg.address, msg.device, msg.address, msg.vals[0], msg.vals[1]);
-                }
-                else
-                {
-                    printf("\r\tlight %s%02d%02d devname=\"DALI %d/%d\"\n", dali_entity_prefix, msg.device, msg.address, msg.device, msg.address);
-                }
-                break;
-            case MSG_SRC_MODBUS:
-                printf("\r\tswitch %s%02d%02d name=\"relay\" devname=\"Modbus %d/%d\"\n", modbus_entity_prefix, msg.device, msg.address, msg.device, msg.address);
-                break;
-            case MSG_SRC_BUTTON_FIXTURE:
-                printf("\r\ttext %s%d%s%d name=\"Binding %d\" devid=button_fixture%d devname=\"Button Fixture %d\" pattern=\"(none|%s\\d{4}|%s\\d{4})\"\n",
-                       fixture_entity_prefix, msg.device, fixture_binding_postfix, msg.address, msg.address, msg.device, msg.device, modbus_entity_prefix, dali_entity_prefix);
-                break;
-            default:
-                break;
-            }
-            break;
-        case STATUS_PRINT_VALUES:
-            switch (msg.bus)
-            {
-            case MSG_SRC_DALI:
-                printf("\r\t%s%02d%02d state=%s brightness=%d\n", dali_entity_prefix, msg.device, msg.address, msg.vals[0] > 0 ? "ON" : "OFF", msg.vals[0]);
-
-                break;
-            case MSG_SRC_MODBUS:
-                printf("\r\t%s%02d%02d %s\n", modbus_entity_prefix, msg.device, msg.address, msg.vals[0] ? "ON" : "OFF");
-                break;
-            case MSG_SRC_BUTTON_FIXTURE:
-                printf("\r\t%s%d%s%d %s\n", fixture_entity_prefix, msg.device, fixture_binding_postfix, msg.address, binding_tostr((uint32_t)msg.vals[0], tmpstr, sizeof(tmpstr)));
-
-                break;
-            default:
-                break;
-            }
-            break;
-
-        case STATUS_LOG:
-            printf("%s\n", msg.msg);
-            break;
-        case STATUS_LOGINT:
-            printf("%s %d\n", msg.msg, msg.vals[0]);
-            break;
-        }
-        stdio_flush();
-    }
-}
-
-void print_msg(log_msg_t *msg)
-{
-    queue_try_add(&output_queue, msg);
-}
-
-void log_i(char *c)
-{
-    log_msg_t msg = {
-        .type = STATUS_LOG,
-        .msg = c,
-    };
-    print_msg(&msg);
-}
-
-void log_int(char *c, int val)
-{
-    log_msg_t msg = {
-        .type = STATUS_LOGINT,
-        .msg = c,
-        .vals = {val, 0, 0}};
-    print_msg(&msg);
 }

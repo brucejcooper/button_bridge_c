@@ -1,3 +1,6 @@
 [submodule "pico-sdk"]
 	path = libraries/pico-sdk
 	url = https://github.com/raspberrypi/pico-sdk.git
+[submodule "libraries/cJSON"]
+	path = libraries/cJSON
+	url = https://github.com/DaveGamble/cJSON.git

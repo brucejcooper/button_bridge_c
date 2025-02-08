@@ -2,3 +2,6 @@ build/
 __pycache__/
 connection_config.py
 .venv/
+secrets.cmake
+.cache/
+.DS_Store

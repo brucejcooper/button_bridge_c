@@ -1,15 +1,18 @@
 
 
+#include <inttypes.h>
 #include <pico/stdlib.h>
 #include <hardware/flash.h>
 #include <hardware/regs/addressmap.h>
 #include <pico/sync.h>
+#include <pico/multicore.h>
 #include <string.h>
 #include <stdio.h>
 #include "buttons.h"
 #include "dali.h"
 #include "modbus.h"
-#include "cli.h"
+#include "network.h"
+#include "stringutil.h"
 
 #define BUTTON_SER_PIN 6
 #define BUTTON_CLK_PIN 7
@@ -27,14 +30,9 @@
 static const uint32_t *bindings = (const uint32_t *)(XIP_BASE + FLASH_CONFIG_OFFSET);
 
 // Trying to use as little memory as possible (when we transition to CH559), we cram stuff together - 2 bytes per switch x 168 is pretty good.
-typedef struct
-{
-    bool released;
-    int velocity;
-    uint countdown;
-} button_ctx_t;
 
-static button_ctx_t button_ctx[NUM_FIXTURES * NUM_BUTTONS_PER_FIXTURE];
+button_ctx_t button_ctx[NUM_FIXTURES * NUM_BUTTONS_PER_FIXTURE];
+
 static int fixture = 0;
 static button_ctx_t *ctx = button_ctx;
 static absolute_time_t next_button_scan;
@@ -78,10 +76,12 @@ static void persist_bindings(uint32_t sector[NUM_BINDINGS])
 {
     sector[NUM_BINDINGS - 1] = MAGIC_VALUE;
     fflush(stdout);
+    multicore_lockout_start_blocking();
     uint32_t ints = save_and_disable_interrupts();
     flash_range_erase(FLASH_CONFIG_OFFSET, FLASH_SECTOR_SIZE); // Must always erase entire sectors
     flash_range_program(FLASH_CONFIG_OFFSET, (const uint8_t *)sector, CONFIG_SZ);
     restore_interrupts(ints);
+    multicore_lockout_end_blocking();
 }
 
 /**
@@ -107,19 +107,52 @@ static void test_flash_config()
     unlock();
 }
 
-static void print_binding_status(int fixture, int button)
-{
-    lock();
-    log_msg_t msg = {
-        .type = STATUS_PRINT_VALUES,
-        .bus = MSG_SRC_BUTTON_FIXTURE,
-        .device = fixture,
-        .address = button,
-        .vals = {(int32_t)bindings[fixture * NUM_BUTTONS_PER_FIXTURE + button], 0, 0},
-    };
-    unlock();
+bool parse_binding(char *sval, binding_t *binding) {
+    int address_min = 0;
+    int address_max;
+    bool has_address = true;
+    char *after;
 
-    print_msg(&msg);
+    if (starts_with(sval, "dali", &after))
+    {
+        binding->type = BINDING_TYPE_DALI;
+        address_max = 63;
+    }
+    else if (starts_with(sval, "modbus", &after))
+    {
+        binding->type = BINDING_TYPE_MODBUS;
+        address_max = 31;
+    }
+    else if (strcmp(sval, "none") == 0)
+    {
+        binding->type = BINDING_TYPE_NONE;
+        has_address = false;
+    }
+    else
+    {
+        return false;
+    }
+
+    if (has_address)
+    {
+        int id = strtoimax(after, &after, 10);
+        binding->device = id / 100;
+        binding->address = id % 100;
+        if (*after != 0 || binding->address < address_min || binding->address > address_max)
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+
+uint32_t get_binding(uint fixture, uint button) {
+    assert(fixture < NUM_FIXTURES && button < NUM_BUTTONS_PER_FIXTURE);
+    lock();
+    uint32_t val = bindings[fixture * NUM_BUTTONS_PER_FIXTURE + button];
+    unlock();
+    return val;
 }
 
 void set_and_persist_binding(uint fixture, uint button, binding_t *binding)
@@ -128,17 +161,14 @@ void set_and_persist_binding(uint fixture, uint button, binding_t *binding)
     assert(fixture < NUM_FIXTURES && button < NUM_BUTTONS_PER_FIXTURE);
     uint32_t sector[NUM_BINDINGS];
     memcpy(sector, bindings, NUM_BINDINGS * sizeof(uint32_t));
-    sector[fixture * NUM_BUTTONS_PER_FIXTURE + button] = encode_binding(binding);
+    uint32_t new_binding = encode_binding(binding);
+    sector[fixture * NUM_BUTTONS_PER_FIXTURE + button] = new_binding;
 
     lock();
     persist_bindings(sector);
     unlock();
-    print_binding_status(fixture, button);
-}
 
-static void log_button_evt(button_ctx_t *ctx, char *evt)
-{
-    int idx = ctx - button_ctx;
+    enqueue_device_update(EVT_BUTTON_BINDING_CHANGED, button_ctx + fixture * NUM_BUTTONS_PER_FIXTURE + button);
 }
 
 /**
@@ -149,9 +179,17 @@ static void log_button_evt(button_ctx_t *ctx, char *evt)
  */
 static void button_pressed(button_ctx_t *ctx)
 {
-    log_button_evt(ctx, "pressed");
+    enqueue_device_update(EVT_BTN_PRESSED, ctx);
+
     ctx->velocity = -ctx->velocity; // Switch direction
     ctx->countdown = ctx->velocity ? MS_TO_COUNTDOWN(250) : MS_TO_COUNTDOWN(750);
+}
+
+
+bool is_button_pressed(int fixture, int button) {
+    int index = fixture * NUM_BUTTONS_PER_FIXTURE + button;
+
+    return !button_ctx[index].released;
 }
 
 static void button_timeout_check(button_ctx_t *ctx)
@@ -173,11 +211,11 @@ static void button_timeout_check(button_ctx_t *ctx)
                 ctx->velocity = -1;
             }
             get_binding_at_index(ctx - button_ctx, &binding);
+            enqueue_device_update(EVT_BTN_HELD, ctx);
 
             // Only DALI devices are dimmable
             if (binding.type == BINDING_TYPE_DALI)
             {
-                log_button_evt(ctx, ctx->velocity > 0 ? "brighten" : "dim");
                 dali_fade(binding.address, ctx->velocity);
             }
         }
@@ -188,54 +226,37 @@ static void button_released(button_ctx_t *ctx)
 {
     binding_t binding;
     get_binding_at_index(ctx - button_ctx, &binding);
+    enqueue_device_update(EVT_BTN_RELEASED, ctx);
+
 
     if (ctx->velocity == 0)
     {
-        log_int("clicked button", ctx - button_ctx);
-
         switch (binding.type)
         {
         case BINDING_TYPE_DALI:
             // log_i("Toggling Dali");
-            log_int("Toggling DALI:", binding.address);
             dali_toggle(binding.address);
             break;
         case BINDING_TYPE_MODBUS:
             // log_i("Toggling Modbus");
-            log_int("Toggling MODBUS:", binding.address);
             modbus_set_coil(1, binding.address, 2);
             break;
         default:
-            log_button_evt(ctx, "not bound");
             break;
         }
     }
     else
     {
-        log_button_evt(ctx, "released");
         ctx->countdown = ctx->velocity ? MS_TO_COUNTDOWN(500) : 0;
     }
 }
 
 void buttons_enumerate()
 {
-    log_msg_t msg = {
-        .type = STATUS_PRINT_DEVICE,
-        .bus = MSG_SRC_BUTTON_FIXTURE,
-    };
-
     int i = 0;
-
-    for (int fixture = 0; fixture < NUM_FIXTURES; fixture++)
-    {
-        msg.device = fixture;
-        for (int button = 0; button < NUM_BUTTONS_PER_FIXTURE; button++)
-        {
-            msg.address = button;
-
-            print_msg(&msg);
-            print_binding_status(fixture, button);
-        }
+    button_ctx_t *btn = button_ctx;
+    for (i = 0; i < NUM_BUTTONS_PER_FIXTURE * NUM_FIXTURES; i++) {
+        enqueue_device_update(EVT_BUTTON_BINDING_CHANGED, btn++);
     }
 }
 
