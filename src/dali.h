@@ -48,13 +48,16 @@ typedef enum  {
 typedef struct {
     int addr;
     dali_gear_type_t type;
+    uint8_t level;
+    uint8_t status;
+    uint8_t fade;
+    uint8_t ext_fade;
     uint8_t min;
     uint8_t max;
-    uint8_t level;
     uint16_t groups;
     uint8_t power_on_level;
+    uint8_t failure_level;
     dali_device_bank_0_t bank0;
-    bool values_changed;
 } dali_dev_data_t;
 
 
@@ -74,7 +77,7 @@ void dali_toggle(int addr);
 void dali_set_on(int addr, bool is_on);
 void dali_set_level(int addr, int level);
 void dali_fade(int addr, int velocity);
-bool dali_start_scan();
+bool dali_enumerate();
 size_t dali_write_discovery_msg(dali_dev_data_t *dev, char *msg, size_t msg_len, char *topic, size_t topic_len, char *switchDeviceID);
 size_t dali_write_values_msg(dali_dev_data_t *dev, char *msg, size_t msg_len, char *topic, size_t topic_len, char *switchDeviceID);
 

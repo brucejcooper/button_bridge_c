@@ -1,20 +1,14 @@
 #include "dali.h"
 #include "dali.pio.h"
-#include "dali_product_db.h"
-#include "log.h"
 #include "stdbool.h"
 #include "stdint.h"
-#include <cJSON.h>
 #include <hardware/clocks.h>
 #include <hardware/structs/clocks.h>
-#include <network.h>
 #include <pico/stdlib.h>
 #include <pico/util/queue.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-
-static const char *gear_type_strs[] = {"flourescent lamp", "emergency lighting", "HID lamp", "Low Voltage Halogen Lamp", "Incandescent Lamp Dimmer", "DC Controlled Dimmer", "LED Lamp", "Relay", "Colour"};
 
 #define DALI_ADDR_FROM_CMD(cmd) ((cmd >> 9) & 0x3F)
 #define DALI_CMD_STRIP_ADDR(cmd) ((cmd) & 0x1FF)
@@ -106,7 +100,6 @@ static void scan_next(int previousAddr) {
   } else {
     dali_scan_in_progress = false;
     // defer_log(TAG, "Dali Scan Done");
-    enqueue_device_update(EVT_DALI_DEVICE_SCAN_COMPLETED, NULL);
   }
 }
 
@@ -118,6 +111,8 @@ static inline char *dali_err_to_str(int val) {
     return "Timeout";
   case DALI_BUS_ERROR:
     return "Bus Error";
+  default:
+    return val >= 0 ? "No Error" : "Unknown error";
   }
 }
 
@@ -125,7 +120,9 @@ static void scan_failed(dali_cmd_t *cmd, int res) {
   dali_dev_data_t *dev = (dali_dev_data_t *)cmd->data;
   int addr = dev - dali_devices;
 
-  defer_log(TAG, "Scan of device %d cmd 0x%04x %s", addr, cmd->op, dali_err_to_str(res));
+  // defer_log(TAG, "Scan of device %d cmd 0x%04x %s", addr, cmd->op, dali_err_to_str(res));
+  // enqueue_device_update(EVT_DALI_DEVICE_DISCOVERED, dev);
+
   dev->type = DALI_GEAR_TYPE_NONE;
   dev->min = dev->max = dev->level = 255;
   // Start a new task to enumerate the next address.
@@ -134,98 +131,6 @@ static void scan_failed(dali_cmd_t *cmd, int res) {
 
 static uint8_t *memptr;
 
-size_t dali_write_discovery_msg(dali_dev_data_t *dev, char *msg, size_t msg_len, char *topic, size_t topic_len, char *switchDeviceID) {
-
-  size_t sz = 0;
-  printf("Writing disco message for address %d with type %d\n", dev->addr, dev->type);
-
-  if (dev->type != DALI_GEAR_TYPE_NONE) {
-    uint64_t gtin = 0;
-    for (int i = 0; i < 6; i++) {
-      gtin = (gtin << 8) | ((uint64_t)dev->bank0.gtin[i]);
-    }
-
-    char serial[18];
-    char *ptr = serial;
-    for (int i = 0; i < 8; i++) {
-      ptr += sprintf(ptr, "%02x", dev->bank0.id[i]);
-      if (i == 4) {
-        *ptr++ = '.';
-      }
-    }
-
-    const dali_product_db_t *prod = find_product_by_gtin(gtin);
-
-    char deviceName[100];
-    char object_id[100];
-    char unique_id[100];
-    char cmdTopic[100];
-    char stateTopic[100];
-    bool dimmable = dev->min < dev->max;
-
-    sprintf(deviceName, "Dali Light %02d", dev->addr);
-    sprintf(object_id, "dali_%d", dev->addr);
-    sprintf(unique_id, "dali_%llu_%s", gtin, serial);
-    sprintf(cmdTopic, "switchy/%s/dali/%d/set", switchDeviceID, dev->addr);
-    sprintf(stateTopic, "switchy/%s/dali/%d", switchDeviceID, dev->addr);
-
-    cJSON *jmsg = cJSON_CreateObject();
-
-    cJSON *device = cJSON_CreateObject();
-    cJSON_AddStringToObject(device, "serial_number", serial);
-    cJSON_AddStringToObject(device, "name", deviceName);
-    cJSON_AddStringToObject(device, "manufacturer", prod ? prod->brand : "Unknown");
-    cJSON_AddStringToObject(device, "model", prod ? prod->product : "Unknown");
-    cJSON *idArray = cJSON_AddArrayToObject(device, "identifiers");
-    cJSON_AddItemToArray(idArray, cJSON_CreateString(serial));
-    cJSON_AddStringToObject(device, "via_device", switchDeviceID);
-
-    cJSON *origin = cJSON_CreateObject();
-    cJSON_AddStringToObject(origin, "name", "dali_bus");
-
-    cJSON_AddItemToObject(jmsg, "device", device);
-    cJSON_AddItemToObject(jmsg, "origin", origin);
-
-    cJSON_AddStringToObject(jmsg, "object_id", "");
-    cJSON_AddStringToObject(jmsg, "unique_id", "");
-    cJSON_AddStringToObject(jmsg, "schema", "json");
-    cJSON_AddNumberToObject(jmsg, "brigthness_scale", 255);
-    cJSON_AddBoolToObject(jmsg, "brightness", dimmable);
-    cJSON_AddStringToObject(jmsg, "supported_color_modes", dimmable ? "brightness" : "onoff");
-    cJSON_AddStringToObject(jmsg, "command_topic", "");
-    cJSON_AddStringToObject(jmsg, "state_topic", "");
-
-    if (!cJSON_PrintPreallocated(jmsg, msg, msg_len, false)) {
-      printf("could not format message to transmit\n");
-    }
-    sz = strlen(msg);
-    cJSON_Delete(jmsg);
-  }
-
-  sprintf(topic, "homeassistant/light/%s/dali_%d/config", switchDeviceID, dev->addr);
-  return sz;
-}
-
-size_t dali_write_values_msg(dali_dev_data_t *dev, char *msg, size_t msg_len, char *topic, size_t topic_len, char *switchDeviceID) {
-
-  size_t sz = 0;
-  printf("Writing Values message for address %d with type %d\n", dev->addr, dev->type);
-  if (dev->type != DALI_GEAR_TYPE_NONE) {
-    bool dimmable = dev->min < dev->max;
-    cJSON *jmsg = cJSON_CreateObject();
-    if (dimmable) {
-      cJSON_AddNumberToObject(jmsg, "brightness", dev->level);
-    }
-    cJSON_AddStringToObject(jmsg, "state", dev->level ? "ON" : "OFF");
-    if (!cJSON_PrintPreallocated(jmsg, msg, msg_len, false)) {
-      printf("could not format message to transmit\n");
-    }
-    sz = strlen(msg);
-    cJSON_Delete(jmsg);
-  }
-  sprintf(topic, "switchy/%s/dali/%d", switchDeviceID, dev->addr);
-  return sz;
-}
 
 static void memory_scan_byte_read(int result, dali_cmd_t *cmd) {
   dali_dev_data_t *dev = cmd->data;
@@ -240,7 +145,8 @@ static void memory_scan_byte_read(int result, dali_cmd_t *cmd) {
     *memptr++ = result;
     int num_read = memptr - ((uint8_t *)&(dev->bank0));
     if (num_read == sizeof(dali_device_bank_0_t)) {
-      defer_log(TAG, "Discovered device %d on DALI bus", dev->addr);
+      // defer_log(TAG, "Discovered device %d on DALI bus", dev->addr);
+      // enqueue_device_update(EVT_DALI_DEVICE_DISCOVERED, dev);
       request_level_update(dev);
       // If necessary, start a scan for the next device address.
       scan_next(addr);
@@ -267,7 +173,7 @@ static void set_memory_scan_address_done(int result, dali_cmd_t *cmd) {
 
 static void set_memory_scan_bank_done(int result, dali_cmd_t *cmd) {
   if (result != -1) {
-    defer_log(TAG, "Error setting DTR0");
+    // defer_log(TAG, "Error setting DTR0");
     scan_failed(cmd, result);
   } else {
     // defer_log(TAG, "Set Memory bank 0, setting address 2");
@@ -291,23 +197,23 @@ static void scan_got_result(int result, dali_cmd_t *cmd) {
     switch (DALI_CMD_STRIP_ADDR(cmd->op)) {
     case DALI_CMD_QUERY_DEVICE_TYPE(0):
       dev->type = result;
-      cmd->op = DALI_CMD_QUERY_MIN(0);
+      cmd->op = DALI_CMD_QUERY_MIN(dev->addr);
       break;
     case DALI_CMD_QUERY_MIN(0):
       dev->min = result;
-      cmd->op = DALI_CMD_QUERY_MAX(0);
+      cmd->op = DALI_CMD_QUERY_MAX(dev->addr);
       break;
     case DALI_CMD_QUERY_MAX(0):
       dev->max = result;
-      cmd->op = DALI_CMD_QUERY_POWER_ON_LEVEL(0);
+      cmd->op = DALI_CMD_QUERY_POWER_ON_LEVEL(dev->addr);
       break;
     case DALI_CMD_QUERY_POWER_ON_LEVEL(0):
       dev->power_on_level = result;
-      cmd->op = DALI_CMD_QUERY_GROUPS_ZERO_TO_SEVEN(0);
+      cmd->op = DALI_CMD_QUERY_GROUPS_ZERO_TO_SEVEN(dev->addr);
       break;
     case DALI_CMD_QUERY_GROUPS_ZERO_TO_SEVEN(0):
       dev->groups = result;
-      cmd->op = DALI_CMD_QUERY_GROUPS_EIGHT_TO_FIFTEEN(0);
+      cmd->op = DALI_CMD_QUERY_GROUPS_EIGHT_TO_FIFTEEN(dev->addr);
       break;
     case DALI_CMD_QUERY_GROUPS_EIGHT_TO_FIFTEEN(0):
       dev->groups |= result << 8;
@@ -322,6 +228,11 @@ static void scan_got_result(int result, dali_cmd_t *cmd) {
 }
 
 static void fade_received_status(int status, dali_cmd_t *cmd) {
+  int addr = DALI_ADDR_FROM_CMD(cmd->op);
+  int device = 1;
+  dali_dev_data_t *dev = dali_devices + addr;
+  dev->status = status;
+
   if (status & DALI_STATUS_FADE_IN_PROGRESS) {
     // Fade still active.  Check again
     request_level_update(cmd->data);
@@ -332,13 +243,7 @@ static void fade_received_level(int lvl, dali_cmd_t *cmd) {
   int addr = DALI_ADDR_FROM_CMD(cmd->op);
   int device = 1;
   dali_dev_data_t *dev = dali_devices + addr;
-
-  if (lvl != dev->level) {
-    dev->level = lvl;
-    dev->values_changed = true;
-    enqueue_device_update(EVT_DALI_LEVEL_CHANGED, dev);
-  }
-  // log_i("\r\t%s%d state=%s brightness=%d", dali_entity_prefix, addr, lvl > 0 ? "on" : "off", lvl);
+  dev->level = lvl;
 
   cmd->op = DALI_CMD_QUERY_STATUS(addr);
   cmd->then = fade_received_status;
@@ -410,6 +315,8 @@ void dali_init(uint32_t tx_pin, uint32_t rx_pin) {
 
   pio_sm_init(pio, dali_sm, offset, &c);
   pio_sm_set_enabled(pio, dali_sm, true);
+
+  dali_enumerate();
 }
 
 static inline void send_dali_cmd(uint cmd) {
@@ -470,7 +377,7 @@ void dali_set_level(int addr, int level) {
   queue_try_add(&dali_queue, &cmd);
 }
 
-bool dali_start_scan() {
+bool dali_enumerate() {
   if (dali_scan_in_progress) {
     return false;
   }

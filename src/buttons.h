@@ -14,13 +14,14 @@ typedef enum
 typedef struct
 {
     binding_type_t type;
-    int device;
-    int address;
+    unsigned int device;
+    unsigned int address;
 } binding_t;
 
 typedef struct
 {
     bool released;
+    uint num_repeats;
     int velocity;
     uint countdown;
 } button_ctx_t;
@@ -39,12 +40,9 @@ void buttons_init();
 void buttons_enumerate();
 void buttons_poll();
 void set_and_persist_binding(uint fixture, uint button, binding_t *binding);
-uint32_t encode_binding(binding_t *binding);
-void decode_binding(uint32_t encoded, binding_t *binding);
 void get_binding_at_index(uint index, binding_t *binding);
 uint32_t get_binding(uint fixture, uint button);
 bool is_button_pressed(int fixture, int button);
-bool parse_binding(char *sval, binding_t *binding);
 
 
 #endif
