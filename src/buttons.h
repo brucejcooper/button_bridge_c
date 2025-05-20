@@ -14,12 +14,12 @@ typedef enum
 typedef struct
 {
     binding_type_t type;
-    unsigned int device;
     unsigned int address;
 } binding_t;
 
 typedef struct
 {
+    int addr;
     bool released;
     uint num_repeats;
     int velocity;
@@ -40,8 +40,7 @@ void buttons_init();
 void buttons_enumerate();
 void buttons_poll();
 void set_and_persist_binding(uint fixture, uint button, binding_t *binding);
-void get_binding_at_index(uint index, binding_t *binding);
-uint32_t get_binding(uint fixture, uint button);
+void init_binding_at_index(uint index, binding_t *binding);
 bool is_button_pressed(int fixture, int button);
 
 

@@ -25,6 +25,7 @@ typedef enum {
     MODBUS_CMD_WRITE_SINGLE_REGISTER = 0x06,
     MODBUS_CMD_WRITE_MULTIPLE_COILS = 0x15,
     MODBUS_CMD_WRITE_MULTIPLE_REGISTERS = 0x16,
+    MODBUS_CMD_CUSTOM_EXEC_DALI = 0x44,
 } modbus_cmd_t;
   
 typedef enum {
@@ -40,19 +41,17 @@ typedef enum {
     MODBUS_ERR_GATEWAY_TARGET_DEVICE_FAILED_TO_RESPOND = 0x0b,
 } modbus_err_t;
 
-typedef void (*modbus_task_cb)(modbus_task_state_t state, uint8_t *response, size_t sz, void *arg);
+typedef void (*modbus_task_cb)(modbus_task_state_t state, uint8_t *cmd, uint8_t *response, size_t sz);
 
 
 void modbus_init(int tx_pin, int rx_pin, int cs_pin);
-bool modbus_downstream_task_enqueue(uint8_t *cmd, size_t sz, modbus_task_cb callback, void *arg);
 void modbus_poll();
-
 void modbus_downstream_set_coil(uint8_t devaddr, uint16_t coil_num, uint16_t value, modbus_task_cb cb);
-void modbus_downstream_set_coils(uint8_t devaddr, uint16_t coil_num, uint16_t count, uint8_t *value, modbus_task_cb cb);
-void modbus_downstream_get_coils(uint8_t devaddr, uint16_t coil_num, uint16_t num_coils, modbus_task_cb cb);
 
 int modbus_expected_length(uint8_t *buf, size_t sz);
 void onError();
+void toggleLED();
+
 
 
 #endif

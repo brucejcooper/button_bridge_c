@@ -35,6 +35,7 @@ add_executable(button_handler
    src/buttons.c
    src/modbus_receiver.c
    src/crcbuf.c
+   src/regs.c
 )
 
 
