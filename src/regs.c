@@ -184,6 +184,7 @@ int get_holding_reg(unsigned addr) {
     return val;
 }
 
+
 void set_holding_reg_bit(int addr, int bit) {
     if (addr >= MAX_HOLDING_REGISTERS) {
         return;

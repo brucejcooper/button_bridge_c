@@ -42,15 +42,9 @@ static int next_fixture_poll = 0;
 static button_ctx_t *ctx = button_ctx;
 static absolute_time_t next_fixture_scan_time;
 
-critical_section_t binding_access_lock;
-
 static const char *tag = "Button";
-
-static inline void lock() { critical_section_enter_blocking(&binding_access_lock); }
-
-static inline void unlock() { critical_section_exit(&binding_access_lock); }
-
-static void decode_binding(uint16_t encoded, binding_t *binding) {
+static void fetch_binding(unsigned int addr, binding_t *binding) {
+    int encoded = get_holding_reg(BINDINGS_HR_BASE + ctx->addr);
     binding->address = encoded & 0x3FFF;
     binding->type = encoded >> 14;
 }
@@ -58,50 +52,41 @@ static void decode_binding(uint16_t encoded, binding_t *binding) {
 #define MAGIC_VALUE (('M' << 24) | ('E' << 16) | ('C' << 8) | 'Z')
 static inline bool flash_bindings_invalid() { return bindings[NUM_BINDINGS - 1] != MAGIC_VALUE; }
 
-void init_binding_at_index(uint addr, binding_t *binding) {   
-    uint16_t val; 
+void init_binding_reg_from_flash(uint addr, binding_t *binding) {
+    uint16_t val;
     if (flash_bindings_invalid()) {
         val = 0xC000;
     } else {
-        lock();
         val = bindings[addr];
-        unlock();
     }
-    set_holding_reg(BINDINGS_HR_BASE+addr, val);
+    set_holding_reg(BINDINGS_HR_BASE + addr, val);
 }
 
 /**
  * NOTE this function must only be called from the second core.
  */
-void set_and_persist_binding(uint fixture, uint button, binding_t *binding) {
-    assert(fixture < NUM_FIXTURES && button < NUM_BUTTONS_PER_FIXTURE);
-    uint32_t sector[NUM_BINDINGS];
-    if (flash_bindings_invalid()) {
-        // Its a first write, so clear everything out.
-        for (int i = 0; i < NUM_BINDINGS - 1; i++) {
-            // Default to NO binding
-            sector[i] = BINDING_TYPE_NONE << 14;
-        }
-        // Last one is a special magic value.
-        sector[NUM_BINDINGS - 1] = MAGIC_VALUE;
-    } else {
-        // Make a copy of the existing bindings (including the magic value)
-        memcpy(sector, bindings, NUM_BINDINGS * sizeof(uint32_t));
-    }
+void set_and_persist_binding(unsigned int addr, uint16_t encoded_binding) {
+    assert(addr < NUM_FIXTURES * NUM_BUTTONS_PER_FIXTURE);
+    // First, set the holding register
+    set_holding_reg(addr, encoded_binding);
 
-    uint16_t new_binding = binding->type << 14 | (binding->address & 0x3FFF);
-    sector[fixture * NUM_BUTTONS_PER_FIXTURE + button] = new_binding;
+    // Then write the bindings to flash
+    // We need to re-write the entire config sector
+    uint32_t sector[NUM_BINDINGS];
+    for (int i = 0; i < NUM_BINDINGS - 1; i++) {
+        // Default to NO binding
+        sector[i] = (i < NUM_FIXTURES * NUM_BUTTONS_PER_FIXTURE) ? get_holding_reg(i) : BINDING_TYPE_NONE << 14;
+    }
+    // Last one is a special magic value.
+    sector[NUM_BINDINGS - 1] = MAGIC_VALUE;
 
     // Write the values.
-    lock();
     multicore_lockout_start_blocking();
     uint32_t ints = save_and_disable_interrupts();
-    flash_range_erase(FLASH_CONFIG_OFFSET,
-                      FLASH_SECTOR_SIZE);  // Must always erase entire sectors
+    flash_range_erase(FLASH_CONFIG_OFFSET, FLASH_SECTOR_SIZE);  // Must always erase entire sectors
     flash_range_program(FLASH_CONFIG_OFFSET, (const uint8_t *)sector, CONFIG_SZ);
     restore_interrupts(ints);
     multicore_lockout_end_blocking();
-    unlock();
 }
 
 /**
@@ -114,12 +99,12 @@ void set_and_persist_binding(uint fixture, uint button, binding_t *binding) {
 static void button_pressed(button_ctx_t *ctx) {
     binding_t binding;
     set_discrete_input(ctx->addr);
-    decode_binding(get_holding_reg(BINDINGS_HR_BASE+ctx->addr), &binding);
+    fetch_binding(ctx->addr, &binding);
 
     int fixture = ctx->addr / NUM_BUTTONS_PER_FIXTURE;
     int button_id = ctx->addr % NUM_BUTTONS_PER_FIXTURE;
 
-    // Side effects of pressing button. 
+    // Side effects of pressing button.
     switch (binding.type) {
         case BINDING_TYPE_DALI:
             // Dali non-fadeable toggles on press.
@@ -167,7 +152,7 @@ static void button_timeout_check(button_ctx_t *ctx) {
                 // DIMMING bit
                 ctx->velocity = -1;
             }
-            decode_binding(get_holding_reg(BINDINGS_HR_BASE+ctx->addr), &binding);
+            fetch_binding(ctx->addr, &binding);
 
             // enqueue_device_update(EVT_BTN_HELD, ctx);
 
@@ -194,7 +179,7 @@ static void button_timeout_check(button_ctx_t *ctx) {
 
 static void button_released(button_ctx_t *ctx) {
     binding_t binding;
-    decode_binding(get_holding_reg(BINDINGS_HR_BASE+ctx->addr), &binding);
+    fetch_binding(ctx->addr, &binding);
 
     clear_discrete_input(ctx->addr);
 
@@ -215,18 +200,13 @@ static void button_released(button_ctx_t *ctx) {
 }
 
 void buttons_init() {
-    critical_section_init(&binding_access_lock);
     binding_t binding;
 
     // Start with empty discrete inputs.
     // Copy bindings from flash into holding registers
     for (int i = 0; i < MAX_DISCRETE_INPUTS; i++) {
         clear_discrete_input(i);
-        if (i < NUM_FIXTURES*NUM_BUTTONS_PER_FIXTURE) {
-            init_binding_at_index(i, &binding);
-        } else {
-            set_holding_reg(BINDINGS_HR_BASE+i, 0xC000);
-        }
+        init_binding_reg_from_flash(i, &binding);
     }
     // test_flash_config();
 

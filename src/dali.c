@@ -438,9 +438,9 @@ static void set_fade_time_to_dtr0(int res, dali_cmd_t *cmd) {
 
 void dali_set_fade_time(int addr, int level) { set_dtr0(addr, level, set_fade_time_to_dtr0); }
 
-static void set_fade_rate_complete(int ret, dali_cmd_t *cmd) {
+static void set_fade_rate_complete(int res, dali_cmd_t *cmd) {
     // Fade time becomes the lower nibble of the LSB of the Holding register.
-    if (ret >= 0) {
+    if (res >= 0) {
         set_holding_reg_nibble(DALI_FADE_HR_BASE + cmd->addr, 0, cmd->param);
     }
 }

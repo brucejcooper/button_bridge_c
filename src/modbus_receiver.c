@@ -62,9 +62,9 @@ void modbus_write_registers(uint8_t device, uint8_t cmd, uint16_t addr, uint16_t
 static void modbus_set_coil_completed(modbus_task_state_t state, uint8_t *cmd, uint8_t *downstream_response, size_t sz) {
     switch (state) {
         case MODBUS_TASK_STATE_DONE:
-            // The response is reflection a copy of the call.
-            memcpy(res_bytes, downstream_response, sz - 2);
-            response = res_bytes + sz - 2;
+            // The response is a copy of the request.
+            memcpy(response, cmd_bytes + 2, 4);
+            response += 4;
             // Register Has already been updated by downstream system
             break;
         default:
@@ -76,78 +76,75 @@ static void modbus_set_coil_completed(modbus_task_state_t state, uint8_t *cmd, u
 }
 
 void set_coil(uint8_t device, uint8_t cmd, uint16_t addr, uint16_t value) {
-    if (addr >= MAX_COILS) {
+    if (addr >= MAX_COILS + MAX_DALI_LIGHTS) {
+    }
+    if (addr < MAX_COILS) {
+        modbus_downstream_set_coil(1 + addr / 32, addr % 32, value, modbus_set_coil_completed);
+        await_downstream_response();
+        return;
+    } else if (addr < MAX_COILS + MAX_DALI_LIGHTS) {
+        dali_toggle(addr - MAX_COILS);
+        // Response is a copy of the request.
+        memcpy(response, cmd_bytes + 2, 4);
+        response += 4;
+    } else {
         set_response_to_error(device, cmd, MODBUS_ERR_ILLEGAL_DATA_ADDR);
         return;
     }
-    modbus_downstream_set_coil(1, addr, value, modbus_set_coil_completed);
-    await_downstream_response();
 }
 
-bool set_holding_register_action(int addr, uint16_t value) {
-    // First set of values are
+void set_holding_register_action(int addr, uint16_t value) {
+    // First set of values are Button Bindings
     if (addr < MAX_DISCRETE_INPUTS) {
-        // Its a binding
+        set_and_persist_binding(addr, value);
+        return;
     }
 
-    // After the bindings, we have banks of 64 registers, one register for each fitting on the dali bus.
-    addr -= MAX_DISCRETE_INPUTS;
-    if (addr < MAX_DALI_LIGHTS) {
-        // Its light level - Ignore status
-        dali_set_level(addr, value & 0xFF);
+    // After the bindings, we have banks of 64 registers, one register for each ballast on the dali bus.
+	addr -= MAX_DISCRETE_INPUTS;
+    unsigned dali_bank = DALI_HR_BANK_ID_FROM_REGID(addr);
+    addr = DALI_ADDR_FROM_REGID(addr);
+	uint16_t currentGroups, diff;
 
-        // The dali refresh code will update the register for us once we're done.
-        return false;
-    }
-
-    addr -= MAX_DALI_LIGHTS;
-    if (addr < MAX_DALI_LIGHTS) {
-        // Its Max and Min
-        dali_set_max_level(addr, value >> 8);
-        dali_set_min_level(addr, value & 0xFF);
-        return true;
-    }
-
-    addr -= MAX_DALI_LIGHTS;
-    if (addr < MAX_DALI_LIGHTS) {
-        // Its Ext Fade Fade Time and Fade Time/Rate
-        dali_set_extended_fade_time(addr, value >> 8);
-        dali_set_fade_time(addr, value & 0xFF);
-        dali_set_fade_rate(addr, value & 0xFF);
-        return true;
-    }
-
-    addr -= MAX_DALI_LIGHTS;
-    if (addr < MAX_DALI_LIGHTS) {
-        // Its System Level and failure level
-        dali_set_system_failure_level(addr, value >> 8);
-        dali_set_power_on_level(addr, value & 0xFF);
-        return true;
-    }
-
-    addr -= MAX_DALI_LIGHTS;
-    if (addr < MAX_DALI_LIGHTS) {
-        // Its groups.
-        // Each group must be set or removed as a separate operation. We do this by looking at current groups
-        uint16_t currentGroups = get_holding_reg(DALI_GROUPS_HR_BASE + addr);
-        uint16_t diff = currentGroups ^ value;
-        for (int group = 0; group < 16; group++) {
-            if (diff & 0x01) {
-                if (currentGroups & 0x01) {
-                    // It was present, so we remove it.
-                    dali_remove_from_group(addr, group);
-                } else {
-                    dali_add_to_group(addr, group);
+    switch (dali_bank) {
+        case 0:
+            // Its light level - Ignore status
+            dali_set_level(addr, value & 0xFF);
+            break;
+        case 1:
+            dali_set_max_level(addr, value >> 8);
+            dali_set_min_level(addr, value & 0xFF);
+            break;
+        case 2:
+            // Its Ext Fade Fade Time and Fade Time/Rate
+            dali_set_extended_fade_time(addr, value >> 8);
+            dali_set_fade_time(addr, value & 0xFF);
+            dali_set_fade_rate(addr, value & 0xFF);
+            break;
+        case 3:
+            // Its System Level and failure level
+            dali_set_system_failure_level(addr, value >> 8);
+            dali_set_power_on_level(addr, value & 0xFF);
+            break;
+        case 4:
+            // Its groups.
+            // Each group must be set or removed as a separate operation. We do this by looking at current groups
+            currentGroups = get_holding_reg(DALI_GROUPS_HR_BASE + addr);
+            diff = currentGroups ^ value;
+            for (int group = 0; group < 16; group++) {
+                if (diff & 0x01) {
+                    if (currentGroups & 0x01) {
+                        // It was present, so we remove it.
+                        dali_remove_from_group(addr, group);
+                    } else {
+                        dali_add_to_group(addr, group);
+                    }
                 }
+                currentGroups >>= 1;
+                diff >>= 1;
             }
-            currentGroups >>= 1;
-            diff >>= 1;
-        }
-        return true;
+            break;
     }
-
-    // If we get here, it means we've run out of registers, so it will be a no-op
-    return true;
 }
 
 void modbus_write_holding_register(uint8_t device, uint8_t cmd, uint16_t addr, uint16_t value) {
@@ -155,17 +152,13 @@ void modbus_write_holding_register(uint8_t device, uint8_t cmd, uint16_t addr, u
         set_response_to_error(device, cmd, MODBUS_ERR_ILLEGAL_DATA_ADDR);
         return;
     }
-
-    // Set the register via a mutex to avoid cross-core problems, but only if its not doing a fade after the change.
     set_holding_register_action(addr, value);
-    await_downstream_response();
 
+	// Response is just a reflection of the input
     *response++ = addr >> 8;
     *response++ = addr & 0xFF;
     *response++ = value >> 8;
     *response++ = value & 0xFF;
-
-    // Set the value.
 }
 
 void send_modbus_bits(uint8_t device, modbus_cmd_t cmd, uint16_t addr, uint16_t count) {
