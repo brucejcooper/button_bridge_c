@@ -40,7 +40,7 @@ typedef enum {
     DALI_GEAR_TYPE_NONE = 255,        // No device present.
 } dali_gear_type_t;
 
-typedef void (*cmd_executed_cb_t)(int result);
+typedef void (*dali_result_cb_t)(int result);
 
 
 // extern dali_dev_data_t dali_devices[64];
@@ -48,24 +48,20 @@ extern bool dali_scan_in_progress;
 
 bool dali_is_fadeable(int addr);
 
-void dali_exec_cmd(uint16_t cmd, cmd_executed_cb_t cb);
+void dali_exec_cmd(uint16_t cmd, dali_result_cb_t resultHandler, bool sendTwice);
 
 void dali_init(uint32_t tx_pin, uint32_t rx_pin);
 void dali_poll();
-void dali_toggle(int addr);
-void dali_set_on(int addr, bool is_on);
-void dali_set_level(int addr, int level);
-void dali_set_max_level(int addr, int level);
-void dali_set_min_level(int addr, int level);
-void dali_set_extended_fade_time(int addr, int level);
-void dali_set_fade_time(int addr, int level);
-void dali_set_fade_rate(int addr, int level);
-void dali_set_system_failure_level(int addr, int level);
-void dali_set_power_on_level(int addr, int level);
-void dali_remove_from_group(int addr, int group);
-void dali_add_to_group(int addr, int group);
+void dali_toggle(int addr, dali_result_cb_t cb);
+void dali_set_on(int addr, bool is_on, dali_result_cb_t cb);
+void dali_set_level(int addr, int level, dali_result_cb_t cb);
+void dali_set_min_max_level(int addr, unsigned min, unsigned max, dali_result_cb_t cb);
+void dali_set_fade_time_rate(int addr, unsigned time, unsigned rate, dali_result_cb_t cb);
+void dali_set_power_on_level(int addr, int powerOnLevel, int systemFailLevel, dali_result_cb_t cb);
+void dali_remove_from_group(int addr, int group, dali_result_cb_t cb);
+void dali_add_to_group(int addr, int group, dali_result_cb_t cb);
 
-void dali_fade(int addr, int velocity);
+void dali_fade(int addr, int velocity, dali_result_cb_t cb);
 bool dali_enumerate();
 
 #endif

@@ -110,7 +110,7 @@ static void button_pressed(button_ctx_t *ctx) {
             // Dali non-fadeable toggles on press.
             if (binding.address >= 0 && binding.address < 64) {
                 if (!dali_is_fadeable(binding.address)) {
-                    dali_toggle(binding.address);
+                    dali_toggle(binding.address, NULL);
                 }
             }
             break;
@@ -161,7 +161,7 @@ static void button_timeout_check(button_ctx_t *ctx) {
                 if (dali_is_fadeable(binding.address)) {
                     // defer_log(tag, "Fading DALI device %d direction %d",
                     // binding.address, ctx->velocity);
-                    dali_fade(binding.address, ctx->velocity);
+                    dali_fade(binding.address, ctx->velocity, NULL);
                 } else {
                     if (ctx->num_repeats == 1) {
                         // defer_log(tag, "Ignoring long hold for non-fadeable DALI device
@@ -190,7 +190,7 @@ static void button_released(button_ctx_t *ctx) {
 
         if (binding.type == BINDING_TYPE_DALI && binding.address < 64) {
             if (dali_is_fadeable(binding.address)) {
-                dali_toggle(binding.address);
+                dali_toggle(binding.address, NULL);
             }
         }
     } else {

@@ -23,7 +23,6 @@
 #include "modbus.h"
 #include "regs.h"
 
-// queue used as a simple sempaphore.
 static semaphore_t downstream_response_ready;
 static uint16_t read_crc = 0xFFFF;
 
@@ -33,25 +32,33 @@ static uint8_t cmd_bytes[MODBUS_SERVER_READ_MAX_PACKET_SZ];
 static uint8_t res_bytes[MODBUS_SERVER_READ_MAX_PACKET_SZ];
 static uint8_t *response;
 
-#define DEVICE_ADDR_FIXTURES 128
-#define DEVICE_ADDR_DALI 129
+typedef struct {
+    unsigned addr;
+    unsigned changed;
+    unsigned newGroups;
+    unsigned nextGroupId;
+} dali_group_change_t;
+dali_group_change_t groupChange;
 
-void set_response_to_error(uint8_t device, modbus_cmd_t cmd, modbus_err_t err) {
-    // reset the buffer, if it had anything written to it.  This will overwrite
-    // what was there.
-    response[1] |= 0x80;  // Set the error MSB on the cmd that was set earlier
-    response[2] = err;
+static void set_response_to_error(modbus_err_t err) {
+    // reset the buffer, if it had anything written to it.  This will overwrite what was there.
+    res_bytes[0] = cmd_bytes[0];
+    res_bytes[1] = cmd_bytes[1] | 0x80;  // Set the error MSB on the cmd that was set earlier
+    res_bytes[2] = err;
     response = res_bytes + 3;
 }
 
-void await_downstream_response() {
+static bool await_downstream_response() {
     if (!sem_acquire_timeout_ms(&downstream_response_ready, 1000)) {
         // Timeout while waiting for a response.
-        set_response_to_error(cmd_bytes[0], cmd_bytes[1], MODBUS_ERR_GATEWAY_TARGET_DEVICE_FAILED_TO_RESPOND);
+        // toggleLED();
+        set_response_to_error(MODBUS_ERR_GATEWAY_TARGET_DEVICE_FAILED_TO_RESPOND);
+        return false;
     }
+    return true;
 }
 
-void modbus_write_registers(uint8_t device, uint8_t cmd, uint16_t addr, uint16_t data[], uint16_t num_regs) {
+static void modbus_write_registers(uint8_t device, uint8_t cmd, uint16_t addr, uint16_t data[], uint16_t num_regs) {
     // TODO set the registers
     *response++ = addr >> 8;
     *response++ = addr & 0xFF;
@@ -60,37 +67,84 @@ void modbus_write_registers(uint8_t device, uint8_t cmd, uint16_t addr, uint16_t
 }
 
 static void modbus_set_coil_completed(modbus_task_state_t state, uint8_t *cmd, uint8_t *downstream_response, size_t sz) {
-    switch (state) {
-        case MODBUS_TASK_STATE_DONE:
-            // The response is a copy of the request.
-            memcpy(response, cmd_bytes + 2, 4);
-            response += 4;
-            // Register Has already been updated by downstream system
-            break;
-        default:
-            set_response_to_error(cmd_bytes[0], cmd_bytes[1], MODBUS_ERR_GATEWAY_TARGET_DEVICE_FAILED_TO_RESPOND);
-            break;
+    if (state != MODBUS_TASK_STATE_DONE) {
+        set_response_to_error(MODBUS_ERR_GATEWAY_TARGET_DEVICE_FAILED_TO_RESPOND);
     }
     // Let the main thread know it can continue.
     sem_release(&downstream_response_ready);
 }
 
-void set_coil(uint8_t device, uint8_t cmd, uint16_t addr, uint16_t value) {
-    if (addr >= MAX_COILS + MAX_DALI_LIGHTS) {
+static bool daliCommandSucceeded(int res, bool nakIsOkay) {
+    if (res < 0) {
+        switch (res) {
+            case DALI_NAK:
+                set_response_to_error(MODBUS_ERR_NACK);
+
+                break;
+            case DALI_BUS_ERROR:
+                set_response_to_error(MODBUS_ERR_SLAVE_DEVICE_FAIL);
+                break;
+            case DALI_TIMEOUT:
+            default:
+                set_response_to_error(MODBUS_ERR_GATEWAY_TARGET_DEVICE_FAILED_TO_RESPOND);
+                break;
+        }
+        return false;
     }
+    return true;
+}
+
+static void dali_command_complete(int res) {
+    daliCommandSucceeded(res, true);
+    sem_release(&downstream_response_ready);
+}
+
+static inline bool no_response_set() { return response - res_bytes == 2; }
+
+void set_coil(uint8_t device, uint8_t cmd, uint16_t addr, uint16_t value) {
     if (addr < MAX_COILS) {
         modbus_downstream_set_coil(1 + addr / 32, addr % 32, value, modbus_set_coil_completed);
         await_downstream_response();
-        return;
     } else if (addr < MAX_COILS + MAX_DALI_LIGHTS) {
-        dali_toggle(addr - MAX_COILS);
-        // Response is a copy of the request.
+        dali_toggle(addr - MAX_COILS, dali_command_complete);
+        await_downstream_response();
+        // The level is not guaranteed to have been changed immediately after this, as fading is an asynchronous process.
+    } else {
+        set_response_to_error(MODBUS_ERR_ILLEGAL_DATA_ADDR);
+    }
+    // Copy the request to the response, if no error was set
+    if (no_response_set()) {
         memcpy(response, cmd_bytes + 2, 4);
         response += 4;
-    } else {
-        set_response_to_error(device, cmd, MODBUS_ERR_ILLEGAL_DATA_ADDR);
-        return;
     }
+}
+
+static void dali_custom_command_complete(int res) {
+    if (daliCommandSucceeded(res, true)) {
+        *response++ = res;
+    }
+    sem_release(&downstream_response_ready);
+}
+
+static void dali_group_change_step(int responseFromLastChange) {
+    if (daliCommandSucceeded(responseFromLastChange, true)) {
+        while (groupChange.nextGroupId < 16) {
+            if (groupChange.changed & 0x01) {
+                // Send the change, then wait for a callback.
+                if (groupChange.newGroups & 1) {
+                    dali_add_to_group(groupChange.addr, groupChange.nextGroupId, dali_group_change_step);
+                } else {
+                    dali_remove_from_group(groupChange.addr, groupChange.nextGroupId, dali_group_change_step);
+                }
+                return;  // Without releasing the semaphore, as we haven't finished the loop yet.  The command we just enqueued
+                         // will call this callback again to complete the set command.
+            }
+            groupChange.changed >>= 1;
+            groupChange.newGroups >>= 1;
+            groupChange.nextGroupId++;
+        }
+    }
+    sem_release(&downstream_response_ready);
 }
 
 void set_holding_register_action(int addr, uint16_t value) {
@@ -101,69 +155,69 @@ void set_holding_register_action(int addr, uint16_t value) {
     }
 
     // After the bindings, we have banks of 64 registers, one register for each ballast on the dali bus.
-	addr -= MAX_DISCRETE_INPUTS;
+    addr -= MAX_DISCRETE_INPUTS;
     unsigned dali_bank = DALI_HR_BANK_ID_FROM_REGID(addr);
     addr = DALI_ADDR_FROM_REGID(addr);
-	uint16_t currentGroups, diff;
+    uint16_t currentGroups, diff;
 
     switch (dali_bank) {
-        case 0:
+        case DALI_HR_BANKID_STATUS:
             // Its light level - Ignore status
-            dali_set_level(addr, value & 0xFF);
+            dali_set_level(addr, value & 0xFF, dali_command_complete);
+            await_downstream_response();
             break;
-        case 1:
-            dali_set_max_level(addr, value >> 8);
-            dali_set_min_level(addr, value & 0xFF);
+        case DALI_HR_BANKID_MINMAX:
+            dali_set_min_max_level(addr, value & 0xFF, value >> 8, dali_command_complete);
+            await_downstream_response();
             break;
-        case 2:
+        case DALI_HR_BANKID_FADE:
             // Its Ext Fade Fade Time and Fade Time/Rate
-            dali_set_extended_fade_time(addr, value >> 8);
-            dali_set_fade_time(addr, value & 0xFF);
-            dali_set_fade_rate(addr, value & 0xFF);
+            dali_set_fade_time_rate(addr, value & 0xFF, value >> 8, dali_command_complete);
+            await_downstream_response();
             break;
-        case 3:
+        case DALI_HR_BANKID_POWERON:
             // Its System Level and failure level
-            dali_set_system_failure_level(addr, value >> 8);
-            dali_set_power_on_level(addr, value & 0xFF);
+            dali_set_power_on_level(addr, value & 0xFF, value >> 8, dali_command_complete);
+            await_downstream_response();
             break;
-        case 4:
-            // Its groups.
-            // Each group must be set or removed as a separate operation. We do this by looking at current groups
-            currentGroups = get_holding_reg(DALI_GROUPS_HR_BASE + addr);
-            diff = currentGroups ^ value;
-            for (int group = 0; group < 16; group++) {
-                if (diff & 0x01) {
-                    if (currentGroups & 0x01) {
-                        // It was present, so we remove it.
-                        dali_remove_from_group(addr, group);
-                    } else {
-                        dali_add_to_group(addr, group);
-                    }
-                }
-                currentGroups >>= 1;
-                diff >>= 1;
+        case DALI_HR_BANKID_GROUPS:
+            // Each group must be set or removed as a separate operation. We do this as a series of operations, only completing
+            // once we've done all 16.
+            groupChange.changed = get_holding_reg(DALI_GROUPS_HR_BASE + addr) ^ value;
+            if (groupChange.changed) {
+                groupChange.newGroups = value;
+                groupChange.nextGroupId = 0;
+                groupChange.addr = addr;
+
+                dali_group_change_step(0);
+                await_downstream_response();
             }
+            break;
+        default:
+            set_response_to_error(MODBUS_ERR_ILLEGAL_DATA_ADDR);
             break;
     }
 }
 
 void modbus_write_holding_register(uint8_t device, uint8_t cmd, uint16_t addr, uint16_t value) {
     if (addr >= MAX_HOLDING_REGISTERS) {
-        set_response_to_error(device, cmd, MODBUS_ERR_ILLEGAL_DATA_ADDR);
+        set_response_to_error(MODBUS_ERR_ILLEGAL_DATA_ADDR);
         return;
     }
-    set_holding_register_action(addr, value);
 
-	// Response is just a reflection of the input
+    // Response is just a reflection of the input
     *response++ = addr >> 8;
     *response++ = addr & 0xFF;
     *response++ = value >> 8;
     *response++ = value & 0xFF;
+
+    // We do the action after setting the response, so that it can set an error code if it wants.
+    set_holding_register_action(addr, value);
 }
 
-void send_modbus_bits(uint8_t device, modbus_cmd_t cmd, uint16_t addr, uint16_t count) {
+void read_modbus_bits(uint8_t device, modbus_cmd_t cmd, uint16_t addr, uint16_t count) {
     if (addr + count > MAX_COILS || addr % 8 != 0 || count % 8 != 0) {
-        set_response_to_error(device, cmd, MODBUS_ERR_ILLEGAL_DATA_ADDR);
+        set_response_to_error(MODBUS_ERR_ILLEGAL_DATA_ADDR);
         return;
     }
     unsigned numBytes = count / 8;
@@ -182,30 +236,12 @@ void send_modbus_holding_registers(uint8_t device, uint8_t cmd, uint16_t addr, u
     uint16_t val;
 
     if (addr + count > MAX_HOLDING_REGISTERS) {
-        set_response_to_error(device, cmd, MODBUS_ERR_ILLEGAL_DATA_ADDR);
+        set_response_to_error(MODBUS_ERR_ILLEGAL_DATA_ADDR);
         return;
     }
     *response++ = count * 2;
     copy_holding_regs(response, addr, count);
     response += count * 2;
-}
-
-static void dali_command_complete(int res) {
-    if (res == DALI_NAK) {
-        set_response_to_error(cmd_bytes[0], cmd_bytes[1], MODBUS_ERR_NACK);
-    } else if (res == DALI_BUS_ERROR) {
-        set_response_to_error(cmd_bytes[0], cmd_bytes[1], MODBUS_ERR_SLAVE_DEVICE_FAIL);
-    } else if (res == DALI_TIMEOUT) {
-        set_response_to_error(cmd_bytes[0], cmd_bytes[1], MODBUS_ERR_GATEWAY_TARGET_DEVICE_FAILED_TO_RESPOND);
-    } else {
-        *response++ = res;
-    }
-    sem_release(&downstream_response_ready);
-}
-
-static void exec_custom_dali(int device, uint16_t command) {
-    dali_exec_cmd(command, dali_command_complete);
-    await_downstream_response();
 }
 
 static int modbus_read_device() {
@@ -268,14 +304,20 @@ static int modbus_read_bytestr(uint8_t *out) {
     return num_bytes;
 }
 
+static bool start_process(int process_type) {
+    switch (process_type) {
+        case 0:
+            dali_enumerate();
+            return true;
+        default:
+            return false;
+    }
+}
+
 static void modbus_run_cmd() {
     int device, addr, count, value, expected_bytes, byte_count;
+    int cmd_repeat;
     uint8_t bytes[256];
-
-    // Wait until the bus is idle for at least 1.75ms (bus reset)
-    // This discards all characters till this point.
-    //   while (getchar_timeout_us(1750) >= 0) {
-    //   }
 
     device = modbus_read_device();
     int cmd = modbus_read_uint8();
@@ -303,7 +345,7 @@ static void modbus_run_cmd() {
             if (!modbus_read_crc()) {
                 break;
             }
-            send_modbus_bits(device, cmd, addr, count);
+            read_modbus_bits(device, cmd, addr, count);
             break;
 
         case MODBUS_CMD_READ_INPUT_REGISTERS:
@@ -318,7 +360,7 @@ static void modbus_run_cmd() {
             }
             // You can only request up to 125 values.
             if (count > 125) {
-                set_response_to_error(device, cmd, MODBUS_ERR_ILLEGAL_DATA_ADDR);
+                set_response_to_error(MODBUS_ERR_ILLEGAL_DATA_ADDR);
                 return;
             }
             if (!modbus_read_crc()) {
@@ -362,7 +404,6 @@ static void modbus_run_cmd() {
             break;
 
         case MODBUS_CMD_WRITE_MULTIPLE_COILS:
-
             addr = modbus_read_uint16();
             if (addr < 0) {
                 break;
@@ -385,10 +426,10 @@ static void modbus_run_cmd() {
             }
 
             if (byte_count != expected_bytes) {
-                set_response_to_error(device, cmd, MODBUS_ERR_ILLEGAL_DATA_VALUE);
+                set_response_to_error(MODBUS_ERR_ILLEGAL_DATA_VALUE);
             } else {
                 // we don't support setting multiple coils (yet);
-                set_response_to_error(device, cmd, MODBUS_ERR_ILLEGAL_FUNCTION);
+                set_response_to_error(MODBUS_ERR_ILLEGAL_FUNCTION);
             }
             break;
 
@@ -410,7 +451,7 @@ static void modbus_run_cmd() {
                 break;
             }
             if (byte_count != expected_bytes) {
-                set_response_to_error(device, cmd, MODBUS_ERR_ILLEGAL_DATA_VALUE);
+                set_response_to_error(MODBUS_ERR_ILLEGAL_DATA_VALUE);
             } else {
                 // The values will be non word aligned in the source, so we need
                 // to copy them.
@@ -422,14 +463,33 @@ static void modbus_run_cmd() {
 
         case MODBUS_CMD_CUSTOM_EXEC_DALI:
             value = modbus_read_uint16();
+            if (value < 0) {
+                break;
+            }
+            cmd_repeat = modbus_read_uint8();
+            if (cmd_repeat < 0) {
+                break;
+            }
+            if (!modbus_read_crc()) {
+                break;
+            }
+            dali_exec_cmd(value, dali_custom_command_complete, cmd_repeat ? true : false);
+            await_downstream_response();
+            break;
+
+        case MODBUS_CMD_CUSTOM_START_PROCESS:
+            value = modbus_read_uint8();
             if (addr < 0) {
                 break;
             }
             if (!modbus_read_crc()) {
                 break;
             }
-            exec_custom_dali(device, value);
-
+            if (start_process(value)) {
+                *response++ = value;
+            } else {
+                set_response_to_error(MODBUS_ERR_ILLEGAL_DATA_ADDR);
+            }
             break;
     }
     size_t sz = response - res_bytes;

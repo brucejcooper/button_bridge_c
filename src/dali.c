@@ -20,9 +20,9 @@ typedef struct dali_cmd_t {
     unsigned int addr;
     uint16_t op;
     uint8_t param;
-    unsigned int transmitCount;
+    bool sendTwice;
     cmd_chain_cb_t then;
-    cmd_executed_cb_t finally;
+    dali_result_cb_t finally;
 } dali_cmd_t;
 
 #define DALI_ADDR_FROM_CMD(cmd) ((cmd >> 9) & 0x3F)
@@ -81,9 +81,9 @@ typedef struct dali_cmd_t {
 static const PIO pio = pio0;
 static const unsigned int dali_sm = 0;
 
-#define QUEUE_DEPTH 20
+#define QUEUE_DEPTH 70
 static queue_t dali_queue;
-static dali_cmd_t in_flight = {.op = 0, .transmitCount = 1, .addr = 0xFF, .then = NULL, .finally = NULL, .param = 0};
+static dali_cmd_t in_flight = {.op = 0, .sendTwice = false, .addr = 0xFF, .then = NULL, .finally = NULL, .param = 0};
 
 bool dali_scan_in_progress = false;
 
@@ -105,7 +105,7 @@ static void scan_dali_device(int addr) {
                       .addr = addr,
                       .then = scan_got_result,
                       .finally = NULL,
-                      .transmitCount = 1,
+                      .sendTwice = false,
                       .param = 0};
     if (!queue_try_add(&dali_queue, &cmd)) {
         onError();
@@ -152,6 +152,9 @@ static void scan_failed(dali_cmd_t *cmd, int res) {
     // dev);
     set_holding_reg(DALI_STATUS_HR_BASE + cmd->addr, 0xFFFF);
     set_holding_reg(DALI_MINMAX_HR_BASE + cmd->addr, 0xFFFF);
+    set_holding_reg(DALI_POWERON_HR_BASE + cmd->addr, 0xFFFF);
+    set_holding_reg(DALI_FADE_HR_BASE + cmd->addr, 0xFFFF);
+    set_holding_reg(DALI_GROUPS_HR_BASE + cmd->addr, 0);
 
     // Start a new task to enumerate the next address.
     scan_next(cmd->addr);
@@ -217,7 +220,6 @@ static void scan_got_result(int result, dali_cmd_t *cmd) {
     if (result < 0) {
         scan_failed(cmd, result);
     } else {
-        bool done = false;
         cmd->then = scan_got_result;
 
         switch (DALI_CMD_STRIP_ADDR(cmd->op)) {
@@ -256,15 +258,10 @@ static void scan_got_result(int result, dali_cmd_t *cmd) {
                 break;
             case DALI_CMD_QUERY_GROUPS_EIGHT_TO_FIFTEEN(0):
                 set_holding_reg_byte(DALI_GROUPS_HR_BASE + cmd->addr, 1, result);
-                // cmd->op = DALI_CMD_SET_DTR1(0);
-                // cmd->then = set_memory_scan_bank_done;
-                cmd->then = NULL;
                 request_level_update(cmd->addr);
+                cmd->then = NULL;
                 scan_next(cmd->addr);
                 break;
-        }
-        if (done) {
-            scan_next(cmd->addr);
         }
     }
 }
@@ -292,20 +289,23 @@ static void fade_received_level(int lvl, dali_cmd_t *cmd) {
     cmd->then = fade_received_status;
 }
 
-static void report_level_with_fade(int ret, dali_cmd_t *cmd) {
+static void async_report_level_with_fade(int ret, dali_cmd_t *cmd) {
     // We don't want other commands to be stalled waiting for a fade to conclude,
     // so we push a new command rather than update the existing one.
     dali_cmd_t newcmd = {.op = DALI_CMD_QUERY_ACTUAL_LEVEL(cmd->addr),
                          .addr = cmd->addr,
                          .then = fade_received_level,
                          .finally = NULL,
-                         .transmitCount = 1,
+                         .sendTwice = false,
                          .param = 0};
     queue_try_add(&dali_queue, &newcmd);
 }
 
-void dali_exec_cmd(uint16_t cmd, cmd_executed_cb_t cb) {
-    dali_cmd_t newcmd = {.op = cmd, .addr = 0, .then = NULL, .finally = cb, .transmitCount = 1, .param = 0};
+static void noop_result_handler(int ret, dali_cmd_t *cmd) {}
+
+void dali_exec_cmd(uint16_t cmd, dali_result_cb_t resultHandler, bool sendTwice) {
+    dali_cmd_t newcmd = {
+        .op = cmd, .addr = 0, .then = noop_result_handler, .finally = resultHandler, .sendTwice = sendTwice, .param = 0};
     queue_try_add(&dali_queue, &newcmd);
 }
 
@@ -314,15 +314,15 @@ static void request_level_update(int addr) {
                          .addr = addr,
                          .then = fade_received_level,
                          .finally = NULL,
-                         .transmitCount = 1,
+                         .sendTwice = false,
                          .param = 0};
     queue_try_add(&dali_queue, &newcmd);
 }
 
-static void toggle_action(int lvl, dali_cmd_t *cmd) {
+static void toggle_level_received(int lvl, dali_cmd_t *cmd) {
     // Follow through from level check to send out the on or off command.
     cmd->op = lvl > 0 ? DALI_CMD_OFF(cmd->addr) : DALI_CMD_RECALL_LAST_ACTIVE_LEVEL(cmd->addr);
-    cmd->then = report_level_with_fade;
+    cmd->then = async_report_level_with_fade;
 }
 
 // ----------------------------- API -------------------------
@@ -333,36 +333,37 @@ static inline void send_dali_cmd(uint cmd) {
     pio_sm_put_blocking(pio, dali_sm, ((cmd << 15) | 0x80000000) + 88);
 }
 
-
-void dali_toggle(int addr) {
+void dali_toggle(int addr, dali_result_cb_t cb) {
     dali_cmd_t cmd = {.op = DALI_CMD_QUERY_ACTUAL_LEVEL(addr),
                       .addr = addr,
-                      .then = toggle_action,
-                      .finally = NULL,
-                      .transmitCount = 1,
+                      .then = toggle_level_received,
+                      .finally = cb,
+                      .sendTwice = false,
                       .param = 0};
     queue_try_add(&dali_queue, &cmd);
 }
 
-void dali_set_on(int addr, bool is_on) {
+void dali_set_on(int addr, bool is_on, dali_result_cb_t cb) {
     dali_cmd_t cmd = {.op = is_on ? DALI_CMD_RECALL_LAST_ACTIVE_LEVEL(addr) : DALI_CMD_OFF(addr),
                       .addr = addr,
-                      .then = report_level_with_fade,
-                      .finally = NULL,
-                      .transmitCount = 1,
+                      .then = async_report_level_with_fade,
+                      .finally = cb,
+                      .sendTwice = false,
                       .param = is_on};
     queue_try_add(&dali_queue, &cmd);
 }
 
-void dali_set_level(int addr, int level) {
+void dali_set_level(int addr, int level, dali_result_cb_t cb) {
     dali_cmd_t cmd = {.op = addr << 9 | level,
                       .addr = addr,
-                      .then = report_level_with_fade,
-                      .finally = NULL,
-                      .transmitCount = 1,
+                      .then = async_report_level_with_fade,
+                      .finally = cb,
+                      .sendTwice = false,
                       .param = level};
     queue_try_add(&dali_queue, &cmd);
 }
+
+// --------- MIN / MAX Register
 
 static void set_max_complete(int res, dali_cmd_t *cmd) {
     if (res >= 0) {
@@ -373,70 +374,40 @@ static void set_max_complete(int res, dali_cmd_t *cmd) {
 static void set_max_to_dtr0(int res, dali_cmd_t *cmd) {
     if (res >= 0) {
         cmd->op = DALI_CMD_SET_MAX_LEVEL(cmd->addr);
-        cmd->transmitCount = 2;
+        cmd->sendTwice = true;
         cmd->then = set_max_complete;
     }
 }
 
-static void set_dtr0(int addr, int val, cmd_chain_cb_t then) {
-    dali_cmd_t cmd = {
-        .op = DALI_CMD_SET_DTR0(val), .addr = val, .then = then, .finally = NULL, .transmitCount = 1, .param = val};
-    queue_try_add(&dali_queue, &cmd);
-}
-
-void dali_set_max_level(int addr, int level) { set_dtr0(addr, level, set_max_to_dtr0); }
-
 static void set_min_complete(int res, dali_cmd_t *cmd) {
     if (res >= 0) {
-        set_holding_reg_byte(DALI_MINMAX_HR_BASE + cmd->addr, 0, cmd->param);
+        set_holding_reg_byte(DALI_MINMAX_HR_BASE + cmd->addr, 0, cmd->param & 0xFF);
+
+        cmd->op = DALI_CMD_SET_DTR0(cmd->param >> 8);
+        cmd->sendTwice = false;
+        cmd->then = set_max_to_dtr0;
     }
 }
 
 static void set_min_to_dtr0(int res, dali_cmd_t *cmd) {
     if (res >= 0) {
         cmd->op = DALI_CMD_SET_MIN_LEVEL(cmd->addr);
-        cmd->transmitCount = 2;
+        cmd->sendTwice = true;
         cmd->then = set_min_complete;
     }
 }
 
-void dali_set_min_level(int addr, int level) { set_dtr0(addr, level, set_min_to_dtr0); }
-
-static void set_extended_fade_complete(int res, dali_cmd_t *cmd) {
-    int hr = DALI_FADE_HR_BASE + cmd->addr;
-    // Extended fade is stored in the MSB of the Holding Register
-
-    if (res >= 0) {
-        set_holding_reg_byte(DALI_FADE_HR_BASE + cmd->addr, 1, cmd->param);
-    }
+void dali_set_min_max_level(int addr, unsigned min, unsigned max, dali_result_cb_t cb) {
+    dali_cmd_t cmd = {.op = DALI_CMD_SET_DTR0(min),
+                      .addr = addr,
+                      .then = set_min_to_dtr0,
+                      .finally = cb,
+                      .sendTwice = false,
+                      .param = min | max << 8};
+    queue_try_add(&dali_queue, &cmd);
 }
 
-static void set_extended_fade_time_to_dtr0(int res, dali_cmd_t *cmd) {
-    if (res >= 0) {
-        cmd->op = DALI_CMD_SET_EXTENDED_FADE_TIME(cmd->addr);
-        cmd->transmitCount = 2;
-        cmd->then = set_extended_fade_complete;
-    }
-}
-
-void dali_set_extended_fade_time(int addr, int level) { set_dtr0(addr, level, set_extended_fade_time_to_dtr0); }
-
-static void set_fade_time_complete(int ret, dali_cmd_t *cmd) {
-    // Fade time becomes the upper nibble of the LSB of the Holding register.
-    if (ret >= 0) {
-        set_holding_reg_nibble(DALI_FADE_HR_BASE + cmd->addr, 1, cmd->param);
-    }
-}
-
-static void set_fade_time_to_dtr0(int res, dali_cmd_t *cmd) {
-    if (res >= 0) {
-        cmd->op = DALI_CMD_SET_FADE_TIME(cmd->addr);
-        cmd->transmitCount = 2;
-        cmd->then = set_fade_time_complete;
-    }
-}
-
-void dali_set_fade_time(int addr, int level) { set_dtr0(addr, level, set_fade_time_to_dtr0); }
+// ----- FADE TIME/RATE Register
 
 static void set_fade_rate_complete(int res, dali_cmd_t *cmd) {
     // Fade time becomes the lower nibble of the LSB of the Holding register.
@@ -448,12 +419,41 @@ static void set_fade_rate_complete(int res, dali_cmd_t *cmd) {
 static void set_fade_rate_to_dtr0(int res, dali_cmd_t *cmd) {
     if (res >= 0) {
         cmd->op = DALI_CMD_SET_FADE_RATE(cmd->addr);
-        cmd->transmitCount = 2;
+        cmd->sendTwice = true;
         cmd->then = set_fade_rate_complete;
     }
 }
 
-void dali_set_fade_rate(int addr, int level) { set_dtr0(addr, level, set_fade_rate_to_dtr0); }
+static void set_fade_time_complete(int ret, dali_cmd_t *cmd) {
+    // Fade time becomes the upper nibble of the LSB of the Holding register.
+    if (ret >= 0) {
+        set_holding_reg_nibble(DALI_FADE_HR_BASE + cmd->addr, 1, cmd->param);
+
+        cmd->op = DALI_CMD_SET_DTR0(cmd->param >> 8);
+        cmd->sendTwice = false;
+        cmd->then = set_fade_rate_to_dtr0;
+    }
+}
+
+static void set_fade_time_to_dtr0(int res, dali_cmd_t *cmd) {
+    if (res >= 0) {
+        cmd->op = DALI_CMD_SET_FADE_TIME(cmd->addr);
+        cmd->sendTwice = true;
+        cmd->then = set_fade_time_complete;
+    }
+}
+
+void dali_set_fade_time_rate(int addr, unsigned time, unsigned rate, dali_result_cb_t cb) {
+    dali_cmd_t cmd = {.op = DALI_CMD_SET_DTR0(time),
+                      .addr = addr,
+                      .then = set_fade_time_to_dtr0,
+                      .finally = cb,
+                      .sendTwice = false,
+                      .param = time | rate << 8};
+    queue_try_add(&dali_queue, &cmd);
+}
+
+// -------------- Power on level Register
 
 static void set_system_failure_level_complete(int res, dali_cmd_t *cmd) {
     if (res >= 0) {
@@ -464,28 +464,40 @@ static void set_system_failure_level_complete(int res, dali_cmd_t *cmd) {
 static void dali_set_system_failure_level_to_dtr0(int res, dali_cmd_t *cmd) {
     if (res >= 0) {
         cmd->op = DALI_CMD_SET_SYSTEM_FAIL_LEVEL(cmd->addr);
-        cmd->transmitCount = 2;
+        cmd->sendTwice = true;
         cmd->then = set_system_failure_level_complete;
     }
 }
 
-void dali_set_system_failure_level(int addr, int level) { set_dtr0(addr, level, dali_set_system_failure_level_to_dtr0); }
-
 static void set__power_on_level_complete(int res, dali_cmd_t *cmd) {
     if (res >= 0) {
         set_holding_reg_byte(DALI_POWERON_HR_BASE + cmd->addr, 0, cmd->param);
+
+        cmd->op = DALI_CMD_SET_DTR0(cmd->param >> 8);
+        cmd->sendTwice = false;
+        cmd->then = dali_set_system_failure_level_to_dtr0;
     }
 }
 
 static void dali_set_power_on_level_to_dtr0(int res, dali_cmd_t *cmd) {
     if (res >= 0) {
         cmd->op = DALI_CMD_SET_POWER_ON_LEVEL(cmd->addr);
-        cmd->transmitCount = 2;
+        cmd->sendTwice = true;
         cmd->then = set__power_on_level_complete;
     }
 }
 
-void dali_set_power_on_level(int addr, int level) { set_dtr0(addr, level, dali_set_power_on_level_to_dtr0); }
+void dali_set_power_on_level(int addr, int powerOnLevel, int systemFailLevel, dali_result_cb_t cb) {
+    dali_cmd_t cmd = {.op = DALI_CMD_SET_DTR0(powerOnLevel),
+                      .addr = addr,
+                      .then = dali_set_power_on_level_to_dtr0,
+                      .finally = cb,
+                      .sendTwice = false,
+                      .param = powerOnLevel | systemFailLevel << 8};
+    queue_try_add(&dali_queue, &cmd);
+}
+
+// -------------- Groups Register
 
 static void dali_remove_from_group_completed(int res, dali_cmd_t *cmd) {
     if (res >= 0) {
@@ -493,12 +505,12 @@ static void dali_remove_from_group_completed(int res, dali_cmd_t *cmd) {
     }
 }
 
-void dali_remove_from_group(int addr, int group) {
+void dali_remove_from_group(int addr, int group, dali_result_cb_t cb) {
     dali_cmd_t cmd = {.op = DALI_CMD_REMOVE_FROM_GROUP(addr, group),
                       .addr = addr,
                       .then = dali_remove_from_group_completed,
-                      .finally = NULL,
-                      .transmitCount = 2,
+                      .finally = cb,
+                      .sendTwice = true,
                       .param = group};
     queue_try_add(&dali_queue, &cmd);
 }
@@ -509,12 +521,12 @@ static void dali_add_to_group_completed(int res, dali_cmd_t *cmd) {
     }
 }
 
-void dali_add_to_group(int addr, int group) {
+void dali_add_to_group(int addr, int group, dali_result_cb_t cb) {
     dali_cmd_t cmd = {.op = DALI_CMD_ADD_TO_GROUP(addr, group),
                       .addr = addr,
                       .then = dali_add_to_group_completed,
-                      .finally = NULL,
-                      .transmitCount = 2,
+                      .finally = cb,
+                      .sendTwice = true,
                       .param = group};
     queue_try_add(&dali_queue, &cmd);
 }
@@ -529,17 +541,15 @@ bool dali_enumerate() {
     return true;
 }
 
-void dali_fade(int addr, int velocity) {
+void dali_fade(int addr, int velocity, dali_result_cb_t cb) {
     dali_cmd_t cmd = {.op = velocity > 0 ? DALI_CMD_UP(addr) : DALI_CMD_DOWN(addr),
                       .addr = addr,
-                      .then = report_level_with_fade,
-                      .finally = NULL,
-                      .transmitCount = 1,
+                      .then = async_report_level_with_fade,
+                      .finally = cb,
+                      .sendTwice = false,
                       .param = 0};
     queue_try_add(&dali_queue, &cmd);
 }
-
-
 
 void dali_poll() {
     if (in_flight.then) {
@@ -547,38 +557,37 @@ void dali_poll() {
             uint32_t v = pio_sm_get(pio, dali_sm);
             int res = v == 0xFFFFFFFF ? -1 : v & 0xFF;
 
-            // if (res >= 0 && in_flight.transmitCount > 1) {
-            //     in_flight.transmitCount--;
-            //     // We need to repeat the command again.
-            //     send_dali_cmd(in_flight.op);
-            // } else {
-                cmd_chain_cb_t cb = in_flight.then;
+            // We treat a NAK as a valid response for the purposes of repeating ourselves.  This is especially important as
+            // almost every command that requires retransmission always returns NAK
+            if (res >= DALI_NAK && in_flight.sendTwice) {
+                in_flight.sendTwice = false;
+                // We need to repeat the command again.
+                send_dali_cmd(in_flight.op);
+            } else {
+                cmd_chain_cb_t next_action = in_flight.then;
                 in_flight.then = NULL;
-                cb(res, &in_flight);
-                // If the callback explicitly sets a new *op* and *then*, then we will
-                // transmit it immediately, otherwise we will assume that that transaction
-                // is done.
+                next_action(res, &in_flight);
+                // If the callback explicitly sets a new *then* callback we willtransmit its operation immediately, otherwise we
+                // will assume that that transaction is done.
                 if (in_flight.then) {
                     // The callback has set a followup command, so send it out.
-                    if (in_flight.transmitCount == 0) {
-                        in_flight.transmitCount = 1;
+                    if (in_flight.sendTwice == 0) {
+                        in_flight.sendTwice = false;
                     }
                     send_dali_cmd(in_flight.op);
                 } else {
-                    // Command is Completely done.  Call FInally handler. 
-                    // if (in_flight.finally) {
-                    //     in_flight.finally(res);
-                    // }
+                    // Command is Completely done.  Call Finally handler.
+                    if (in_flight.finally) {
+                        in_flight.finally(res);
+                    }
                 }
-            // }
+            }
         }
     } else if (queue_try_remove(&dali_queue, &in_flight)) {
         pio_sm_restart(pio, dali_sm);
         send_dali_cmd(in_flight.op);
     }
 }
-
-
 
 void dali_init(uint32_t tx_pin, uint32_t rx_pin) {
     for (int i = 0; i < 64; i++) {

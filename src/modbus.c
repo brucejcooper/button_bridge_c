@@ -64,6 +64,11 @@ void toggleLED() {
     gpio_put(LED_PIN, !gpio_get(LED_PIN));
 }
 
+void setLED(bool on) {
+    gpio_put(LED_PIN, on);
+}
+
+
 void onError() {
     // Make the LED blink on error
     while (true) {

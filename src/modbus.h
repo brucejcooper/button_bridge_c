@@ -26,6 +26,7 @@ typedef enum {
     MODBUS_CMD_WRITE_MULTIPLE_COILS = 0x15,
     MODBUS_CMD_WRITE_MULTIPLE_REGISTERS = 0x16,
     MODBUS_CMD_CUSTOM_EXEC_DALI = 0x44,
+    MODBUS_CMD_CUSTOM_START_PROCESS = 0x45,
 } modbus_cmd_t;
   
 typedef enum {
@@ -51,6 +52,7 @@ void modbus_downstream_set_coil(uint8_t devaddr, uint16_t coil_num, uint16_t val
 int modbus_expected_length(uint8_t *buf, size_t sz);
 void onError();
 void toggleLED();
+void setLED(bool on);
 
 
 
