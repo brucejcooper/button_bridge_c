@@ -155,7 +155,6 @@ void set_holding_register_action(int addr, uint16_t value) {
     }
 
     // After the bindings, we have banks of 64 registers, one register for each ballast on the dali bus.
-    addr -= MAX_DISCRETE_INPUTS;
     unsigned dali_bank = DALI_HR_BANK_ID_FROM_REGID(addr);
     addr = DALI_ADDR_FROM_REGID(addr);
     uint16_t currentGroups, diff;
